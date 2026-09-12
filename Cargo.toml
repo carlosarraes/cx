@@ -1,0 +1,31 @@
+[package]
+name = "cx"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "Switch between Codex accounts, including running sessions"
+license = "MIT"
+repository = "https://github.com/carlosarraes/cx"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+clap = { version = "4", features = ["derive"] }
+dirs = "6"
+fs2 = "0.4"
+futures-util = "0.3"
+libc = "0.2"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.28"
+toml = "0.8"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+opt-level = "z"
