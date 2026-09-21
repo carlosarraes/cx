@@ -157,6 +157,78 @@ fn bare_cx_keeps_same_children_when_switching_an_idle_session() {
 }
 
 #[test]
+fn model_selection_does_not_write_shared_config() {
+    let mut f = Fixture::new("model-isolation");
+    f.wait(|f| {
+        f.events()
+            .iter()
+            .any(|e| e.get("model_write_response").is_some())
+    });
+    assert!(
+        !f.events().iter().any(|e| e.get("config_write").is_some()),
+        "model selection reached the shared Codex config"
+    );
+    assert!(!f.dir.path().join("home/config.toml").exists());
+    assert!(f
+        .events()
+        .iter()
+        .any(|e| e["thread_model"] == "gpt-5.6-luna"));
+    let response = f
+        .events()
+        .into_iter()
+        .find(|e| e.get("model_write_response").is_some())
+        .unwrap();
+    assert_eq!(response["model_write_response"]["status"], "ok");
+    assert!(f.finish().success());
+}
+
+#[test]
+fn single_model_config_write_does_not_reach_shared_config() {
+    let mut f = Fixture::new("model-single-write");
+    f.wait(|f| {
+        f.events()
+            .iter()
+            .any(|e| e.get("model_write_response").is_some())
+    });
+    assert!(!f.events().iter().any(|e| e.get("config_write").is_some()));
+    assert!(!f.dir.path().join("home/config.toml").exists());
+    assert!(f.finish().success());
+}
+
+#[test]
+fn mixed_config_write_preserves_unrelated_changes() {
+    let mut f = Fixture::new("mixed-config-write");
+    f.wait(|f| {
+        f.events()
+            .iter()
+            .any(|e| e.get("mixed_write_response").is_some())
+    });
+    assert!(f
+        .events()
+        .iter()
+        .any(|e| e["config_write"] == json!(["tui.notifications"])));
+    assert_eq!(
+        fs::read_to_string(f.dir.path().join("home/config.toml")).unwrap(),
+        "tui.notifications\n"
+    );
+    assert!(f.finish().success());
+}
+
+#[test]
+fn clear_reads_the_panes_model_instead_of_shared_defaults() {
+    let mut f = Fixture::new("clear-model-isolation");
+    f.wait(|f| f.events().iter().any(|e| e.get("clear_defaults").is_some()));
+    let event = f
+        .events()
+        .into_iter()
+        .find(|e| e.get("clear_defaults").is_some())
+        .unwrap();
+    assert_eq!(event["clear_defaults"]["model"], "gpt-5.6-luna");
+    assert_eq!(event["clear_defaults"]["effort"], "high");
+    assert!(f.finish().success());
+}
+
+#[test]
 fn native_turn_creating_commands_defer_switch_until_completion() {
     for method in [
         "turn/start",

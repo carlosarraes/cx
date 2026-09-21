@@ -9,8 +9,13 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::VecDeque, ffi::OsString, fs, os::unix::fs::PermissionsExt, path::PathBuf,
-    process::Stdio, time::Duration,
+    collections::VecDeque,
+    ffi::OsString,
+    fs,
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
+    process::Stdio,
+    time::Duration,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -283,6 +288,7 @@ async fn relay(
     };
     let mut requests = Requests::default();
     let mut turns = Turns::default();
+    let mut pane_model = PaneModel::default();
     let mut login: Option<Login> = None;
     let mut serial = 0u64;
     let mut desired_revision = 0u64;
@@ -325,7 +331,7 @@ async fn relay(
                     Some(Ok(Message::Text(text))) => {
                         let message: Value = serde_json::from_str(&text).context("invalid Codex TUI protocol message")?;
                         if login.is_some() { deferred.push_back(message); }
-                        else { forward_client(message, &mut writer, &mut socket, &mut requests, &mut turns, initialized).await?; }
+                        else { forward_client(message, &mut writer, &mut socket, ClientState { requests: &mut requests, turns: &mut turns, pane_model: &mut pane_model, initialized, codex_home: &store.paths.codex_home }).await?; }
                     }
                     Some(Ok(Message::Ping(bytes))) => { socket.send(Message::Pong(bytes)).await?; },
                     Some(Ok(Message::Close(_))) | None => return Ok(timeout(Duration::from_secs(2), tui.wait()).await.ok().and_then(|r| r.ok()).and_then(|s|s.code()).unwrap_or(0)),
@@ -378,6 +384,7 @@ async fn relay(
                         for reply in waiting.drain(..) { let _=reply.send(status.clone()); }
                     }
                 } else if let Some((id, method)) = requests.restore(&mut message) {
+                    pane_model.response(&id, &method, &mut message);
                     if starts_turn(&method) { turns.start_response(&id, &message); }
                     if method=="initialize" {
                         if message.get("error").is_some() { bail!("Codex refused initialization; update Codex or cx"); }
@@ -445,9 +452,13 @@ async fn relay(
                     message,
                     &mut writer,
                     &mut socket,
-                    &mut requests,
-                    &mut turns,
-                    initialized,
+                    ClientState {
+                        requests: &mut requests,
+                        turns: &mut turns,
+                        pane_model: &mut pane_model,
+                        initialized,
+                        codex_home: &store.paths.codex_home,
+                    },
                 )
                 .await?;
             }
@@ -459,10 +470,15 @@ async fn forward_client(
     mut message: Value,
     writer: &mut ChildStdin,
     socket: &mut Socket,
-    requests: &mut Requests,
-    turns: &mut Turns,
-    initialized: bool,
+    state: ClientState<'_>,
 ) -> Result<()> {
+    let ClientState {
+        requests,
+        turns,
+        pane_model,
+        initialized,
+        codex_home,
+    } = state;
     let method = message["method"].as_str().unwrap_or("").to_owned();
     if method == "initialized" && initialized {
         return Ok(());
@@ -471,10 +487,31 @@ async fn forward_client(
         outgoing(socket,json!({"id":message["id"],"error":{"code":-32601,"message":"Use cx add / cx switch from another terminal to manage this session's account"}})).await?;
         return Ok(());
     }
+    // The TUI updates its active thread separately. Saving this default would
+    // change the model seen by every cx pane sharing CODEX_HOME.
+    if method == "config/batchWrite" {
+        if let Some(edits) = message
+            .pointer_mut("/params/edits")
+            .and_then(Value::as_array_mut)
+        {
+            let original_len = edits.len();
+            edits.retain(|edit| !is_model_config_key(edit["keyPath"].as_str()));
+            if original_len > 0 && edits.is_empty() {
+                acknowledge_local_model_selection(socket, &message, codex_home).await?;
+                return Ok(());
+            }
+        }
+    } else if method == "config/value/write"
+        && is_model_config_key(message.pointer("/params/keyPath").and_then(Value::as_str))
+    {
+        acknowledge_local_model_selection(socket, &message, codex_home).await?;
+        return Ok(());
+    }
     if method == "initialize" {
         message["params"]["capabilities"]["experimentalApi"] = json!(true);
     }
     if let Some(id) = requests.forward(&mut message) {
+        pane_model.request(&id, &method, &message);
         if starts_turn(&method) {
             let thread = message
                 .pointer("/params/threadId")
@@ -484,6 +521,117 @@ async fn forward_client(
         }
     }
     send(writer, &message).await
+}
+
+struct ClientState<'a> {
+    requests: &'a mut Requests,
+    turns: &'a mut Turns,
+    pane_model: &'a mut PaneModel,
+    initialized: bool,
+    codex_home: &'a Path,
+}
+
+#[derive(Default)]
+struct PaneModel {
+    model: Option<String>,
+    effort: Option<Option<String>>,
+    pending: std::collections::HashMap<String, ModelChange>,
+}
+
+#[derive(Default)]
+struct ModelChange {
+    model: Option<String>,
+    effort: Option<Option<String>>,
+}
+
+impl PaneModel {
+    fn request(&mut self, id: &str, method: &str, message: &Value) {
+        let change = match method {
+            "thread/start" | "thread/resume" => ModelChange {
+                model: message
+                    .pointer("/params/model")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                effort: optional_string(message.pointer("/params/config/model_reasoning_effort")),
+            },
+            "thread/settings/update" => ModelChange {
+                model: message
+                    .pointer("/params/model")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                effort: optional_string(message.pointer("/params/effort")),
+            },
+            _ => return,
+        };
+        if change.model.is_some() || change.effort.is_some() {
+            self.pending.insert(id.to_owned(), change);
+        }
+    }
+
+    fn response(&mut self, id: &str, method: &str, message: &mut Value) {
+        if message.get("error").is_none() {
+            if let Some(change) = self.pending.remove(id) {
+                if let Some(model) = change.model {
+                    self.model = Some(model);
+                }
+                if let Some(effort) = change.effort {
+                    self.effort = Some(effort);
+                }
+            }
+            if matches!(method, "thread/start" | "thread/resume") {
+                if let Some(model) = message.pointer("/result/model").and_then(Value::as_str) {
+                    self.model = Some(model.to_owned());
+                }
+                if let Some(effort) = optional_string(message.pointer("/result/reasoningEffort")) {
+                    self.effort = Some(effort);
+                }
+            }
+            if method == "config/read" {
+                if let Some(config) = message.pointer_mut("/result/config") {
+                    if let Some(model) = &self.model {
+                        config["model"] = json!(model);
+                    }
+                    if let Some(effort) = &self.effort {
+                        config["model_reasoning_effort"] = json!(effort);
+                    }
+                }
+            }
+        } else {
+            self.pending.remove(id);
+        }
+    }
+}
+
+fn optional_string(value: Option<&Value>) -> Option<Option<String>> {
+    match value {
+        Some(Value::String(value)) => Some(Some(value.clone())),
+        Some(Value::Null) => Some(None),
+        _ => None,
+    }
+}
+
+fn is_model_config_key(key: Option<&str>) -> bool {
+    matches!(key, Some("model" | "model_reasoning_effort"))
+}
+
+async fn acknowledge_local_model_selection(
+    socket: &mut Socket,
+    message: &Value,
+    codex_home: &Path,
+) -> Result<()> {
+    outgoing(
+        socket,
+        json!({
+            "id": message["id"],
+            "result": {
+                "status": "ok",
+                "version": "cx-session",
+                "filePath": codex_home.join("config.toml"),
+                "overriddenMetadata": null
+            }
+        }),
+    )
+    .await
 }
 
 pub fn print_status(report: &SessionStatus) {

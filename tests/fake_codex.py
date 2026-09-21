@@ -63,6 +63,24 @@ if "app-server" in sys.argv:
                     send({"method": "account/updated", "params": {"authMode": "chatgpt", "planType": "plus"}})
             elif method == "thread/list":
                 send({"id": msg["id"], "result": {"data": [], "nextCursor": None}})
+            elif method == "config/read":
+                send({"id": msg["id"], "result": {"config": {"model": "gpt-5.6-sol", "model_reasoning_effort": "low"}, "origins": {}}})
+            elif method == "thread/start":
+                model = msg["params"].get("model", "gpt-5.6-sol")
+                effort = msg["params"].get("config", {}).get("model_reasoning_effort", "low")
+                send({"id": msg["id"], "result": {"thread": {"id": "thread-a", "preview": "", "ephemeral": False, "modelProvider": "openai", "createdAt": 0, "updatedAt": 0, "status": {"type": "idle"}, "path": "/tmp/thread.jsonl", "cwd": "/tmp", "cliVersion": "0.155.1", "source": "cli", "agentPath": "root", "name": None, "turns": []}, "model": model, "modelProvider": "openai", "serviceTier": None, "cwd": "/tmp", "approvalPolicy": "never", "approvalsReviewer": "user", "sandbox": {"type": "dangerFullAccess"}, "reasoningEffort": effort}})
+            elif method == "config/batchWrite":
+                keys = [edit["keyPath"] for edit in msg["params"]["edits"]]
+                log({"config_write": keys})
+                (root / "home/config.toml").write_text("\n".join(keys) + "\n")
+                send({"id": msg["id"], "result": {"status": "ok", "version": "saved", "filePath": str(root / "home/config.toml"), "overriddenMetadata": None}})
+            elif method == "thread/settings/update":
+                log({"thread_model": msg["params"].get("model")})
+                send({"id": msg["id"], "result": {}})
+            elif method == "config/value/write":
+                log({"config_write": [msg["params"]["keyPath"]]})
+                (root / "home/config.toml").write_text(msg["params"]["keyPath"] + "\n")
+                send({"id": msg["id"], "result": {"status": "ok", "version": "saved", "filePath": str(root / "home/config.toml"), "overriddenMetadata": None}})
             elif method in ["turn/start", "review/start", "thread/compact/start", "thread/queue/start"]:
                 pending = msg
                 (root / "busy").touch()
@@ -135,6 +153,50 @@ while True:
         assert msg["result"]["data"] == []
         break
 (root / "ready").touch()
+if scenario == "model-isolation":
+    send({"id": 29, "method": "thread/settings/update", "params": {"threadId": "thread-a", "model": "gpt-5.6-luna", "effort": "high"}})
+    while receive().get("id") != 29:
+        pass
+    send({"id": 30, "method": "config/batchWrite", "params": {"edits": [
+        {"keyPath": "model", "value": "gpt-5.6-luna", "mergeStrategy": "replace"},
+        {"keyPath": "model_reasoning_effort", "value": "high", "mergeStrategy": "replace"}
+    ], "filePath": None, "expectedVersion": None, "reloadUserConfig": True}})
+    while True:
+        msg = receive()
+        if msg.get("id") == 30:
+            log({"model_write_response": msg.get("result")})
+            break
+if scenario == "model-single-write":
+    send({"id": 31, "method": "config/value/write", "params": {"keyPath": "model_reasoning_effort", "value": "high"}})
+    while True:
+        msg = receive()
+        if msg.get("id") == 31:
+            log({"model_write_response": msg.get("result")})
+            break
+if scenario == "mixed-config-write":
+    send({"id": 32, "method": "config/batchWrite", "params": {"edits": [
+        {"keyPath": "model", "value": "gpt-5.6-luna", "mergeStrategy": "replace"},
+        {"keyPath": "tui.notifications", "value": True, "mergeStrategy": "replace"}
+    ], "filePath": None, "expectedVersion": None, "reloadUserConfig": True}})
+    while True:
+        msg = receive()
+        if msg.get("id") == 32:
+            log({"mixed_write_response": msg.get("result")})
+            break
+if scenario == "clear-model-isolation":
+    send({"id": 40, "method": "thread/start", "params": {"model": "gpt-5.6-sol", "config": {"model_reasoning_effort": "low"}}})
+    while receive().get("id") != 40:
+        pass
+    send({"id": 41, "method": "thread/settings/update", "params": {"threadId": "thread-a", "model": "gpt-5.6-luna", "effort": "high"}})
+    while receive().get("id") != 41:
+        pass
+    send({"id": 42, "method": "config/read", "params": {"includeLayers": False, "cwd": "/tmp"}})
+    while True:
+        msg = receive()
+        if msg.get("id") == 42:
+            config = msg["result"]["config"]
+            log({"clear_defaults": {"model": config.get("model"), "effort": config.get("model_reasoning_effort")}})
+            break
 if scenario in ["turn/start", "review/start", "thread/compact/start", "thread/queue/start"]:
     send({"id": 8, "method": scenario, "params": {"threadId": "thread-a"}})
 while not (root / "quit").exists():
