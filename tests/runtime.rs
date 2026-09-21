@@ -329,6 +329,44 @@ fn lam_relay_lost_post_write_response_is_not_safe_to_retry() {
         .any(|event| event.get("relay_queue").is_some()));
     assert!(f.finish().success());
 }
+
+#[test]
+fn lam_relay_refuses_idle_inspection_and_queue_while_a_native_turn_is_active() {
+    let mut f = Fixture::new("lam-busy");
+    f.wait(|f| {
+        f.events()
+            .iter()
+            .any(|event| event["relay_bind"]["ok"] == true)
+    });
+    f.wait(|f| f.dir.path().join("busy").exists());
+    f.touch("release");
+    f.wait(|f| f.dir.path().join("native_busy_ready").exists());
+
+    let inspect = f.relay(json!({
+        "version": 1,
+        "operation": "inspect",
+        "thread_id": RELAY_THREAD,
+        "binding": RELAY_BINDING
+    }));
+    assert_eq!(inspect, json!({"version":1,"ok":true,"state":"active"}));
+
+    let queue = f.relay(json!({
+        "version": 1,
+        "operation": "queue",
+        "thread_id": RELAY_THREAD,
+        "binding": RELAY_BINDING,
+        "attempt_id": RELAY_ATTEMPT,
+        "text": "peer body"
+    }));
+    assert_eq!(queue["ok"], false);
+    assert_eq!(queue["error"], "unavailable");
+    assert_eq!(queue["submission"], "not_started");
+    assert!(!f
+        .events()
+        .iter()
+        .any(|event| event.get("relay_queue").is_some()));
+    assert!(f.finish().success());
+}
 impl Drop for Fixture {
     fn drop(&mut self) {
         if let Some(child) = &mut self.child {

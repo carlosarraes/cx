@@ -255,8 +255,13 @@ if scenario == "clear-model-isolation":
             config = msg["result"]["config"]
             log({"clear_defaults": {"model": config.get("model"), "effort": config.get("model_reasoning_effort")}})
             break
-if scenario in ["turn/start", "review/start", "thread/compact/start", "thread/queue/start"]:
-    send({"id": 8, "method": scenario, "params": {"threadId": "thread-a"}})
+if scenario in ["turn/start", "review/start", "thread/compact/start", "thread/queue/start", "lam-busy"]:
+    method = "turn/start" if scenario == "lam-busy" else scenario
+    send({"id": 8, "method": method, "params": {"threadId": "thread-a"}})
+    if scenario == "lam-busy":
+        while receive().get("id") != 8:
+            pass
+        (root / "native_busy_ready").touch()
 while not (root / "quit").exists():
     if scenario == "actual":
         send({"id": "read-account", "method": "account/read", "params": {"refreshToken": False}})

@@ -632,6 +632,10 @@ async fn start_relay(
                 ));
                 return;
             }
+            if turns.busy() {
+                let _ = reply.send(RelayResponse::inspected(ThreadState::Active));
+                return;
+            }
             (
                 PendingRelayKind::Inspect { thread_id },
                 json!({"method":"thread/read","params":{"threadId":thread_id,"includeTurns":false}}),
@@ -648,6 +652,13 @@ async fn start_relay(
             if relays.bindings.authenticate(thread_id, &binding).is_err() {
                 let _ = reply.send(RelayResponse::error(
                     ErrorCode::Unauthorized,
+                    Submission::NotStarted,
+                ));
+                return;
+            }
+            if turns.busy() {
+                let _ = reply.send(RelayResponse::error(
+                    ErrorCode::Unavailable,
                     Submission::NotStarted,
                 ));
                 return;
