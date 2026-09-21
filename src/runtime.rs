@@ -192,9 +192,13 @@ async fn run_async(paths: Paths, codex: OsString, args: Vec<OsString>) -> Result
     // The directory's permissions protect both WebSocket and control connections.
     let transport = tempfile::Builder::new().prefix("cx-").tempdir()?;
     fs::set_permissions(transport.path(), fs::Permissions::from_mode(0o700))?;
-    let tui_socket = transport.path().join("tui.sock");
+    let transport_path = transport
+        .path()
+        .canonicalize()
+        .context("resolving private cx transport directory")?;
+    let tui_socket = transport_path.join("tui.sock");
     let listener = UnixListener::bind(&tui_socket)?;
-    let lam_socket = transport.path().join("lam.sock");
+    let lam_socket = transport_path.join("lam.sock");
     let lam_listener = UnixListener::bind(&lam_socket).context("binding LAM relay socket")?;
     fs::set_permissions(&lam_socket, fs::Permissions::from_mode(0o600))?;
     let directory = paths.data.join("runtimes");

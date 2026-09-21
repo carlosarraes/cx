@@ -6,7 +6,7 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::{
     fs,
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{symlink, PermissionsExt},
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
 };
@@ -27,6 +27,8 @@ impl Fixture {
         fs::write(&script, include_str!("fake_codex.py")).unwrap();
         fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
         fs::create_dir(dir.path().join("home")).unwrap();
+        fs::create_dir(dir.path().join("private-tmp")).unwrap();
+        symlink(dir.path().join("private-tmp"), dir.path().join("tmp-link")).unwrap();
         let mut fixture = Self { dir, child: None };
         for account in ["personal", "work"] {
             let claims = json!({"email":format!("{account}@example.test"),"exp":4102444800_i64,"https://api.openai.com/auth":{"chatgpt_account_id":account,"chatgpt_user_id":account,"chatgpt_plan_type":"plus"}});
@@ -60,6 +62,7 @@ impl Fixture {
             .env("CODEX_HOME", self.dir.path().join("home"))
             .env("CX_CODEX_BIN", self.dir.path().join("codex"))
             .env("CX_TEST_DIR", self.dir.path())
+            .env("TMPDIR", self.dir.path().join("tmp-link"))
             .env_remove("OPENAI_API_KEY")
             .env_remove("CODEX_API_KEY");
         cmd
@@ -162,6 +165,8 @@ fn lam_relay_binds_inspects_and_queues_the_exact_thread() {
         fs::read_to_string(f.dir.path().join("stderr")).unwrap()
     );
     let relay_path = fs::read_to_string(f.dir.path().join("relay_path")).unwrap();
+    let relay_parent = std::path::Path::new(relay_path.trim()).parent().unwrap();
+    assert_eq!(relay_parent, relay_parent.canonicalize().unwrap());
     assert_eq!(
         fs::metadata(relay_path.trim())
             .unwrap()
