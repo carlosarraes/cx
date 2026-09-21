@@ -114,6 +114,7 @@ fn choose_next_ignores_unknown_stale_and_disallowed_usage() -> Result<()> {
             primary: Some(Window {
                 used_percent: used,
                 resets_at: None,
+                limit_window_seconds: None,
             }),
             secondary: None,
             observed_at: now,
@@ -134,6 +135,7 @@ fn choose_next_ignores_unknown_stale_and_disallowed_usage() -> Result<()> {
         primary: Some(Window {
             used_percent: 1.0,
             resets_at: None,
+            limit_window_seconds: None,
         }),
         secondary: None,
         observed_at: now - 7200,
@@ -145,10 +147,12 @@ fn choose_next_ignores_unknown_stale_and_disallowed_usage() -> Result<()> {
         primary: Some(Window {
             used_percent: 2.0,
             resets_at: None,
+            limit_window_seconds: None,
         }),
         secondary: Some(Window {
             used_percent: 100.0,
             resets_at: None,
+            limit_window_seconds: None,
         }),
         observed_at: now,
         allowed: true,
@@ -159,6 +163,7 @@ fn choose_next_ignores_unknown_stale_and_disallowed_usage() -> Result<()> {
         primary: Some(Window {
             used_percent: 0.0,
             resets_at: None,
+            limit_window_seconds: None,
         }),
         secondary: None,
         observed_at: now + 60,

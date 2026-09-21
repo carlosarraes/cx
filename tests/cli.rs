@@ -177,3 +177,116 @@ fn next_does_not_use_cached_usage_when_the_live_check_fails() {
     let after: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
     assert_eq!(after["current"], "work");
 }
+
+#[test]
+fn usage_matches_cs_layout_and_labels_a_weekly_primary_window() {
+    let dir = TempDir::new().unwrap();
+    for alias in ["carlos", "carraes"] {
+        auth(&dir, alias);
+        success(command(&dir, &["add", alias, "--current"]));
+    }
+    let path = dir.path().join("data/cx/state.json");
+    let mut state: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let now = chrono::Utc::now().timestamp();
+    state["current_since"] = json!(now - 13 * 60 - 10);
+    state["last_active_at"] = json!({"carlos": now - 78 * 60 - 10});
+    state["accounts"]["carlos"]["usage"] = json!({
+        "primary": {"used_percent": 83, "resets_at": now + 5 * 86400 + 18 * 3600 + 30, "limit_window_seconds": 604800},
+        "secondary": null, "observed_at": now, "allowed": true
+    });
+    state["accounts"]["carraes"]["usage"] = json!({
+        "primary": {"used_percent": 10, "resets_at": now + 2 * 3600 + 53 * 60 + 30, "limit_window_seconds": 18000},
+        "secondary": {"used_percent": 94, "resets_at": now + 86400 + 3 * 3600 + 30, "limit_window_seconds": 604800},
+        "observed_at": now, "allowed": true
+    });
+    fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+    assert_eq!(success(command(&dir, &["usage"])),
+        "- carlos   7d 83% (resets 5d18h) · idle 1h18m\n* carraes  5h 10% (resets 2h53m) · 7d 94% (resets 1d3h) · running 13m\n");
+}
+
+#[test]
+fn switching_tracks_selection_times_without_resetting_a_reselected_account() {
+    let dir = TempDir::new().unwrap();
+    for alias in ["personal", "work"] {
+        auth(&dir, alias);
+        success(command(&dir, &["add", alias, "--current"]));
+    }
+    let path = dir.path().join("data/cx/state.json");
+    let mut state: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert!(state["last_active_at"]["personal"].is_i64());
+    assert!(state["current_since"].is_i64());
+    let earlier = chrono::Utc::now().timestamp() - 3600;
+    state["current_since"] = json!(earlier);
+    fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+    success(command(&dir, &["switch", "work", "--yes"]));
+    let state: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(state["current_since"], earlier);
+    success(command(&dir, &["switch", "-", "--yes"]));
+    let state: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert!(state["current_since"].as_i64().unwrap() > earlier);
+    assert!(state["last_active_at"]["work"].as_i64().unwrap() > earlier);
+    success(command(&dir, &["del", "personal"]));
+    let state: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    assert!(state["current_since"].is_null());
+    assert!(state["last_active_at"].get("personal").is_none());
+}
+
+#[test]
+fn live_usage_preserves_the_server_window_duration() {
+    use std::io::{BufRead, BufReader, Write};
+    let dir = TempDir::new().unwrap();
+    auth(&dir, "carlos");
+    success(command(&dir, &["add", "carlos", "--current"]));
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let body = json!({"rate_limit": {"allowed": true,
+        "primary_window": {"used_percent": 83, "limit_window_seconds": 604800,
+            "reset_at": chrono::Utc::now().timestamp() + 5 * 86400 + 18 * 3600 + 30},
+        "secondary_window": null}})
+    .to_string();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut reader = BufReader::new(&mut stream);
+        loop {
+            let mut line = String::new();
+            assert!(reader.read_line(&mut line).unwrap() > 0);
+            if line == "\r\n" {
+                break;
+            }
+        }
+        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+    });
+    let output = success(
+        cli(&dir, &["usage", "--live"])
+            .env("CX_USAGE_URL", endpoint)
+            .output()
+            .unwrap(),
+    );
+    server.join().unwrap();
+    assert_eq!(output, "* carlos  7d 83% (resets 5d18h) · running <1m\n");
+    assert_eq!(success(command(&dir, &["usage"])), output);
+}
+
+#[test]
+fn legacy_usage_keeps_unknown_durations_and_activity_honest() {
+    let dir = TempDir::new().unwrap();
+    for alias in ["old", "unknown"] {
+        auth(&dir, alias);
+        success(command(&dir, &["add", alias, "--current"]));
+    }
+    let path = dir.path().join("data/cx/state.json");
+    let mut state: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    state.as_object_mut().unwrap().remove("current_since");
+    state.as_object_mut().unwrap().remove("last_active_at");
+    let now = chrono::Utc::now().timestamp();
+    state["accounts"]["old"]["usage"] = json!({
+        "primary": {"used_percent": 100, "resets_at": now - 60},
+        "secondary": null, "observed_at": now - 190, "allowed": false
+    });
+    fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+    assert_eq!(success(command(&dir, &["usage"])),
+        "- old      primary 100% (resets <1m) · [limited] · idle · as of 3m ago\n* unknown  ?? usage unknown (run `cx usage --live`) · running\n");
+}

@@ -57,6 +57,10 @@ pub struct State {
     #[serde(default)]
     pub previous: Option<String>,
     #[serde(default)]
+    pub current_since: Option<i64>,
+    #[serde(default)]
+    pub last_active_at: BTreeMap<String, i64>,
+    #[serde(default)]
     pub accounts: BTreeMap<String, Account>,
 }
 
@@ -76,6 +80,16 @@ impl State {
         if self.accounts.contains_key(alias) && !force {
             bail!("alias '{alias}' already exists");
         }
+        if self
+            .accounts
+            .get(alias)
+            .is_some_and(|old| old.email != account.email || old.account_id != account.account_id)
+        {
+            self.last_active_at.remove(alias);
+            if self.current.as_deref() == Some(alias) {
+                self.current_since = None;
+            }
+        }
         self.accounts.insert(alias.to_owned(), account);
         Ok(())
     }
@@ -89,8 +103,15 @@ impl State {
         if !self.accounts.contains_key(&selected) {
             bail!("unknown account alias '{selected}'");
         }
+        let now = chrono::Utc::now().timestamp();
         if self.current.as_deref() != Some(&selected) {
+            if let Some(outgoing) = &self.current {
+                self.last_active_at.insert(outgoing.clone(), now);
+            }
             self.previous = self.current.replace(selected.clone());
+            self.current_since = Some(now);
+        } else if self.current_since.is_none() {
+            self.current_since = Some(now);
         }
         Ok(selected)
     }
@@ -101,7 +122,9 @@ impl State {
         }
         if self.current.as_deref() == Some(alias) {
             self.current = None;
+            self.current_since = None;
         }
+        self.last_active_at.remove(alias);
         if self.previous.as_deref() == Some(alias) {
             self.previous = None;
         }

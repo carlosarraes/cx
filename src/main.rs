@@ -52,7 +52,7 @@ enum Commands {
     Whoami,
     /// Capture updated credentials after a login outside cx
     Refresh,
-    /// Show each account's cached 5h/7d usage
+    /// Show each account's cached usage windows
     Usage {
         #[arg(long)]
         live: bool,
@@ -230,32 +230,12 @@ fn execute(cli: Cli) -> Result<i32> {
                 }
             }
             let state = store.read()?;
-            for (alias, account) in &state.accounts {
-                let mark = if state.current.as_ref() == Some(alias) {
-                    '*'
-                } else {
-                    ' '
-                };
-                if let Some(observation) = &account.usage {
-                    println!(
-                        "{mark} {alias}  5h {}  7d {}  (observed {}){}",
-                        window(&observation.primary),
-                        window(&observation.secondary),
-                        chrono::DateTime::from_timestamp(observation.observed_at, 0)
-                            .map(|t| t
-                                .with_timezone(&chrono::Local)
-                                .format("%m-%d %H:%M")
-                                .to_string())
-                            .unwrap_or_else(|| "unknown".into()),
-                        if observation.allowed {
-                            ""
-                        } else {
-                            " [limited]"
-                        }
-                    );
-                } else {
-                    println!("{mark} {alias}  usage unknown (run `cx usage --live`)");
-                }
+            for line in usage::format_lines_colored(
+                &state,
+                chrono::Utc::now().timestamp(),
+                usage::colors_enabled(),
+            ) {
+                println!("{line}");
             }
             if state.accounts.is_empty() {
                 println!("No saved accounts.");
@@ -263,25 +243,6 @@ fn execute(cli: Cli) -> Result<i32> {
         }
     }
     Ok(0)
-}
-
-fn window(value: &Option<usage::Window>) -> String {
-    value
-        .as_ref()
-        .map(|w| {
-            let reset = w
-                .resets_at
-                .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
-                .map(|t| {
-                    format!(
-                        ", resets {}",
-                        t.with_timezone(&chrono::Local).format("%m-%d %H:%M")
-                    )
-                })
-                .unwrap_or_default();
-            format!("{:.0}%{reset}", w.used_percent)
-        })
-        .unwrap_or_else(|| "unknown".into())
 }
 
 fn report_switch(paths: &Paths) -> Result<()> {
