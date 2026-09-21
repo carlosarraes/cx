@@ -1,4 +1,6 @@
-use anyhow::{bail, ensure, Context, Result};
+#[cfg(target_os = "linux")]
+use anyhow::Context;
+use anyhow::{bail, ensure, Result};
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use tokio::net::UnixStream;
