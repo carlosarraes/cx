@@ -1,9 +1,12 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UnixListener;
 use tokio::net::UnixStream;
+use tokio::sync::{mpsc, oneshot, Semaphore};
 use tokio::time::{timeout_at, Instant};
 use uuid::Uuid;
 
@@ -193,9 +196,107 @@ impl Response {
         }
     }
 
+    pub fn bound() -> Self {
+        Self::success(None, None)
+    }
+
+    pub fn inspected(state: ThreadState) -> Self {
+        Self::success(Some(state), None)
+    }
+
+    pub fn queued(receipt: Uuid) -> Self {
+        Self::success(None, Some(receipt))
+    }
+
+    fn success(state: Option<ThreadState>, receipt: Option<Uuid>) -> Self {
+        Self {
+            version: PROTOCOL_VERSION,
+            ok: true,
+            state,
+            receipt,
+            error: None,
+            submission: None,
+        }
+    }
+
+    pub(crate) fn accepted(&self) -> bool {
+        self.ok
+    }
+
     #[cfg(test)]
     fn upstream_error(submission: Submission, _source: &anyhow::Error) -> Self {
         Self::error(ErrorCode::UpstreamError, submission)
+    }
+}
+
+pub(crate) struct RelayControl {
+    pub request: Request,
+    pub peer_pid: u32,
+    pub deadline: Instant,
+    pub reply: oneshot::Sender<Response>,
+}
+
+const CONNECTION_LIMIT: usize = 16;
+const REQUEST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+
+pub(crate) async fn serve(listener: UnixListener, tx: mpsc::Sender<RelayControl>) {
+    let slots = Arc::new(Semaphore::new(CONNECTION_LIMIT));
+    while let Ok((mut stream, _)) = listener.accept().await {
+        let Ok(slot) = slots.clone().try_acquire_owned() else {
+            let deadline = Instant::now() + REQUEST_DEADLINE;
+            tokio::spawn(async move {
+                let response = Response::error(ErrorCode::Unavailable, Submission::NotStarted);
+                let _ = write_frame(&mut stream, &response, deadline).await;
+            });
+            continue;
+        };
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let _slot = slot;
+            let deadline = Instant::now() + REQUEST_DEADLINE;
+            let peer_pid = match crate::process::peer_pid(&stream) {
+                Ok(pid) => pid,
+                Err(_) => {
+                    let response = Response::error(ErrorCode::Unauthorized, Submission::NotStarted);
+                    let _ = write_frame(&mut stream, &response, deadline).await;
+                    return;
+                }
+            };
+            let request = match read_frame(&mut stream, deadline).await {
+                Ok(request) => request,
+                Err(_) => {
+                    let response =
+                        Response::error(ErrorCode::InvalidRequest, Submission::NotStarted);
+                    let _ = write_frame(&mut stream, &response, deadline).await;
+                    return;
+                }
+            };
+            let is_queue = matches!(&request, Request::Queue { .. });
+            let (reply, response) = oneshot::channel();
+            let control = RelayControl {
+                request,
+                peer_pid,
+                deadline,
+                reply,
+            };
+            if !matches!(timeout_at(deadline, tx.send(control)).await, Ok(Ok(()))) {
+                let response = Response::error(ErrorCode::Timeout, Submission::NotStarted);
+                let _ = write_frame(&mut stream, &response, deadline).await;
+                return;
+            }
+            let response = match timeout_at(deadline, response).await {
+                Ok(Ok(response)) => response,
+                _ => Response::error(
+                    ErrorCode::Timeout,
+                    if is_queue {
+                        Submission::Uncertain
+                    } else {
+                        Submission::NotStarted
+                    },
+                ),
+            };
+            let _ = write_frame(&mut stream, &response, deadline).await;
+        });
     }
 }
 

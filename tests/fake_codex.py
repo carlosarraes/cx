@@ -16,13 +16,16 @@ import time
 
 root = Path(os.environ["CX_TEST_DIR"])
 scenario = os.environ.get("CX_TEST_SCENARIO", "idle")
+relay_thread = "11111111-1111-4111-8111-111111111111"
+relay_attempt_receipt = "33333333-3333-4333-8333-333333333333"
+relay_binding = "a" * 64
 
 def log(event):
     with (root / "events").open("a") as f:
         f.write(json.dumps(event) + "\n")
 
 if "app-server" in sys.argv:
-    log({"server_pid": os.getpid()})
+    log({"server_pid": os.getpid(), "server_has_relay": "CX_LAM_RELAY" in os.environ})
     if scenario == "actual":
         os.execvp("codex", ["codex"] + sys.argv[1:])
     pending = None
@@ -69,6 +72,27 @@ if "app-server" in sys.argv:
                 model = msg["params"].get("model", "gpt-5.6-sol")
                 effort = msg["params"].get("config", {}).get("model_reasoning_effort", "low")
                 send({"id": msg["id"], "result": {"thread": {"id": "thread-a", "preview": "", "ephemeral": False, "modelProvider": "openai", "createdAt": 0, "updatedAt": 0, "status": {"type": "idle"}, "path": "/tmp/thread.jsonl", "cwd": "/tmp", "cliVersion": "0.155.1", "source": "cli", "agentPath": "root", "name": None, "turns": []}, "model": model, "modelProvider": "openai", "serviceTier": None, "cwd": "/tmp", "approvalPolicy": "never", "approvalsReviewer": "user", "sandbox": {"type": "dangerFullAccess"}, "reasoningEffort": effort}})
+            elif method == "thread/read":
+                thread_id = msg["params"]["threadId"]
+                if scenario == "lam-wrong-thread" and str(msg["id"]).startswith("cx.lam."):
+                    thread_id = "44444444-4444-4444-8444-444444444444"
+                send({"id": msg["id"], "result": {"thread": {"id": thread_id, "status": {"type": "idle"}, "canAcceptDirectInput": True}}})
+            elif method == "thread/queue/add":
+                params = msg["params"]
+                log({"relay_queue": params})
+                if scenario == "lam-queue-drop":
+                    pass
+                elif scenario == "lam-queue-error":
+                    send({"id": msg["id"], "error": {"code": -32000, "message": "provider-private-text"}})
+                else:
+                    queued = {"id": relay_attempt_receipt, "clientUserMessageId": params["clientUserMessageId"], "input": params["input"]}
+                    if scenario == "lam-missing-receipt":
+                        queued.pop("id")
+                    if scenario == "lam-wrong-attempt":
+                        queued["clientUserMessageId"] = "55555555-5555-4555-8555-555555555555"
+                    send({"id": msg["id"], "result": {"queuedSubmission": queued}})
+                    send({"method": "turn/started", "params": {"threadId": params["threadId"], "turn": {"id": "relay-turn", "items": [], "status": "inProgress", "error": None}}})
+                    send({"method": "turn/completed", "params": {"threadId": params["threadId"], "turn": {"id": "relay-turn", "items": [], "status": "completed", "error": None}}})
             elif method == "config/batchWrite":
                 keys = [edit["keyPath"] for edit in msg["params"]["edits"]]
                 log({"config_write": keys})
@@ -143,6 +167,21 @@ def receive():
         length = struct.unpack("!Q", exact(8))[0]
     return json.loads(exact(length))
 
+def relay(request):
+    relay_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    relay_socket.connect(os.environ["CX_LAM_RELAY"])
+    raw = json.dumps(request).encode()
+    relay_socket.sendall(struct.pack("!I", len(raw)) + raw)
+    length_bytes = b""
+    while len(length_bytes) < 4:
+        length_bytes += relay_socket.recv(4 - len(length_bytes))
+    length = struct.unpack("!I", length_bytes)[0]
+    response = b""
+    while len(response) < length:
+        response += relay_socket.recv(length - len(response))
+    relay_socket.close()
+    return json.loads(response)
+
 send({"id": "cx.auth.1", "method": "initialize", "params": {"clientInfo": {"name": "codex_cli_rs", "version": "0.154.0"}, "capabilities": {"experimentalApi": False}}})
 assert receive()["id"] == "cx.auth.1"
 send({"method": "initialized"})
@@ -153,6 +192,21 @@ while True:
         assert msg["result"]["data"] == []
         break
 (root / "ready").touch()
+if scenario.startswith("lam-"):
+    (root / "relay_path").write_text(os.environ["CX_LAM_RELAY"])
+    log({"relay_bind": relay({
+        "version": 1,
+        "operation": "bind",
+        "thread_id": relay_thread,
+        "binding": relay_binding,
+    })})
+    if scenario == "lam-conflict":
+        log({"relay_conflict": relay({
+            "version": 1,
+            "operation": "bind",
+            "thread_id": relay_thread,
+            "binding": "b" * 64,
+        })})
 if scenario == "model-isolation":
     send({"id": 29, "method": "thread/settings/update", "params": {"threadId": "thread-a", "model": "gpt-5.6-luna", "effort": "high"}})
     while receive().get("id") != 29:
@@ -208,5 +262,7 @@ while not (root / "quit").exists():
         if msg.get("id") == "read-account":
             log({"actual_email": msg["result"]["account"]["email"]})
             time.sleep(0.05)
+        elif str(msg.get("id", "")).startswith("cx.lam."):
+            log({"relay_response_leaked_to_tui": msg["id"]})
 s.sendall(bytes([0x88, 0x80]) + os.urandom(4))
 s.close()

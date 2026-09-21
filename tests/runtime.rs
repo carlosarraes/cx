@@ -1,6 +1,8 @@
 #![cfg(unix)]
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde_json::{json, Value};
+use std::io::{Read, Write};
+use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::{
     fs,
@@ -9,6 +11,10 @@ use std::{
     time::{Duration, Instant},
 };
 use tempfile::TempDir;
+
+const RELAY_THREAD: &str = "11111111-1111-4111-8111-111111111111";
+const RELAY_ATTEMPT: &str = "22222222-2222-4222-8222-222222222222";
+const RELAY_BINDING: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 struct Fixture {
     dir: TempDir,
@@ -77,6 +83,35 @@ impl Fixture {
             .filter_map(|s| serde_json::from_str(s).ok())
             .collect()
     }
+    fn relay(&self, request: Value) -> Value {
+        self.relay_result(request).unwrap()
+    }
+    fn relay_result(&self, request: Value) -> Result<Value, String> {
+        let path = fs::read_to_string(self.dir.path().join("relay_path")).unwrap();
+        let mut socket = UnixStream::connect(path.trim()).map_err(|error| error.to_string())?;
+        socket
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .map_err(|error| error.to_string())?;
+        socket
+            .set_write_timeout(Some(Duration::from_secs(3)))
+            .map_err(|error| error.to_string())?;
+        let payload = serde_json::to_vec(&request).unwrap();
+        socket
+            .write_all(&(payload.len() as u32).to_be_bytes())
+            .map_err(|error| error.to_string())?;
+        socket
+            .write_all(&payload)
+            .map_err(|error| error.to_string())?;
+        let mut length = [0_u8; 4];
+        socket
+            .read_exact(&mut length)
+            .map_err(|error| error.to_string())?;
+        let mut response = vec![0_u8; u32::from_be_bytes(length) as usize];
+        socket
+            .read_exact(&mut response)
+            .map_err(|error| error.to_string())?;
+        serde_json::from_slice(&response).map_err(|error| error.to_string())
+    }
     fn wait(&mut self, condition: impl Fn(&Self) -> bool) {
         let start = Instant::now();
         while !condition(self) {
@@ -105,6 +140,185 @@ impl Fixture {
             std::thread::sleep(Duration::from_millis(20));
         }
     }
+}
+
+#[test]
+fn lam_relay_binds_inspects_and_queues_the_exact_thread() {
+    let mut f = Fixture::new("lam-relay");
+    f.wait(|f| {
+        f.events()
+            .iter()
+            .any(|event| event.get("relay_bind").is_some())
+    });
+    let bind = f
+        .events()
+        .into_iter()
+        .find_map(|event| event.get("relay_bind").cloned())
+        .unwrap();
+    assert_eq!(
+        bind["ok"],
+        true,
+        "{bind}; stderr: {}",
+        fs::read_to_string(f.dir.path().join("stderr")).unwrap()
+    );
+    let relay_path = fs::read_to_string(f.dir.path().join("relay_path")).unwrap();
+    assert_eq!(
+        fs::metadata(relay_path.trim())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    assert!(f
+        .events()
+        .iter()
+        .any(|event| event["server_has_relay"] == false));
+
+    let inspect = f.relay(json!({
+        "version": 1,
+        "operation": "inspect",
+        "thread_id": RELAY_THREAD,
+        "binding": RELAY_BINDING
+    }));
+    assert_eq!(inspect, json!({"version":1,"ok":true,"state":"idle"}));
+
+    let queue = f.relay(json!({
+        "version": 1,
+        "operation": "queue",
+        "thread_id": RELAY_THREAD,
+        "binding": RELAY_BINDING,
+        "attempt_id": RELAY_ATTEMPT,
+        "text": "peer body"
+    }));
+    assert_eq!(queue["ok"], true);
+    assert!(uuid::Uuid::parse_str(queue["receipt"].as_str().unwrap()).is_ok());
+    f.wait(|f| {
+        f.events().iter().any(|event| {
+            event["relay_queue"]["threadId"] == RELAY_THREAD
+                && event["relay_queue"]["clientUserMessageId"] == RELAY_ATTEMPT
+                && event["relay_queue"]["input"]
+                    == json!([{"type":"text","text":"peer body","text_elements":[]}])
+        })
+    });
+
+    let rejected = f.relay(json!({
+        "version": 1,
+        "operation": "inspect",
+        "thread_id": RELAY_THREAD,
+        "binding": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    }));
+    assert_eq!(rejected["ok"], false);
+    assert_eq!(rejected["error"], "unauthorized");
+    assert_eq!(rejected["submission"], "not_started");
+    let unrelated_bind = f.relay(json!({
+        "version": 1,
+        "operation": "bind",
+        "thread_id": RELAY_THREAD,
+        "binding": RELAY_BINDING
+    }));
+    assert_eq!(unrelated_bind["error"], "unauthorized");
+    assert_eq!(unrelated_bind["submission"], "not_started");
+    assert!(!f
+        .events()
+        .iter()
+        .any(|event| event.get("relay_response_leaked_to_tui").is_some()));
+    assert!(f.finish().success());
+}
+
+#[test]
+fn lam_relay_rejects_thread_changes_and_conflicting_rebinds() {
+    let mut wrong = Fixture::new("lam-wrong-thread");
+    wrong.wait(|f| {
+        f.events()
+            .iter()
+            .any(|event| event.get("relay_bind").is_some())
+    });
+    let response = wrong
+        .events()
+        .into_iter()
+        .find_map(|event| event.get("relay_bind").cloned())
+        .unwrap();
+    assert_eq!(response["error"], "thread_mismatch");
+    assert!(wrong.finish().success());
+
+    let mut conflict = Fixture::new("lam-conflict");
+    conflict.wait(|f| {
+        f.events()
+            .iter()
+            .any(|event| event.get("relay_conflict").is_some())
+    });
+    let response = conflict
+        .events()
+        .into_iter()
+        .find_map(|event| event.get("relay_conflict").cloned())
+        .unwrap();
+    assert_eq!(response["error"], "conflict");
+    assert_eq!(response["submission"], "not_started");
+    assert!(conflict.finish().success());
+}
+
+#[test]
+fn lam_relay_never_accepts_malformed_or_refused_queue_receipts() {
+    for scenario in [
+        "lam-missing-receipt",
+        "lam-wrong-attempt",
+        "lam-queue-error",
+    ] {
+        let mut f = Fixture::new(scenario);
+        f.wait(|f| {
+            f.events()
+                .iter()
+                .any(|event| event["relay_bind"]["ok"] == true)
+        });
+        let response = f.relay(json!({
+            "version": 1,
+            "operation": "queue",
+            "thread_id": RELAY_THREAD,
+            "binding": RELAY_BINDING,
+            "attempt_id": RELAY_ATTEMPT,
+            "text": "peer body"
+        }));
+        assert_eq!(response["ok"], false, "{scenario}: {response}");
+        assert_eq!(
+            response["error"], "upstream_error",
+            "{scenario}: {response}"
+        );
+        assert_eq!(
+            response["submission"], "uncertain",
+            "{scenario}: {response}"
+        );
+        assert!(!response.to_string().contains("provider-private-text"));
+        assert!(f.finish().success());
+    }
+}
+
+#[test]
+fn lam_relay_lost_post_write_response_is_not_safe_to_retry() {
+    let mut f = Fixture::new("lam-queue-drop");
+    f.wait(|f| {
+        f.events()
+            .iter()
+            .any(|event| event["relay_bind"]["ok"] == true)
+    });
+    let response = f.relay_result(json!({
+        "version": 1,
+        "operation": "queue",
+        "thread_id": RELAY_THREAD,
+        "binding": RELAY_BINDING,
+        "attempt_id": RELAY_ATTEMPT,
+        "text": "peer body"
+    }));
+    if let Ok(response) = response {
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["error"], "timeout");
+        assert_eq!(response["submission"], "uncertain");
+    }
+    assert!(f
+        .events()
+        .iter()
+        .any(|event| event.get("relay_queue").is_some()));
+    assert!(f.finish().success());
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
