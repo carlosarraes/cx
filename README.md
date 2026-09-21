@@ -57,7 +57,7 @@ like `cs add`. The browser must sign in to the intended account.
 | `cx add <alias> --device-auth` | Use Codex device-code login |
 | `cx switch <alias>` | Select an account and notify every managed session |
 | `cx switch -` | Toggle to the previous account |
-| `cx switch next` | Fetch usage and select another eligible account with lowest 5h usage |
+| `cx switch next` | Fetch usage and select another eligible account with lowest primary-window usage |
 | `cx list` | List aliases, `*` current and `-` previous |
 | `cx del <alias>` | Forget an alias without logging out |
 | `cx whoami` | Show live login, selected account, and managed session identities |
@@ -65,12 +65,33 @@ like `cs add`. The browser must sign in to the intended account.
 | `cx usage [--live]` | Show cached usage, or fetch fresh observations |
 | `cx --help` / `cx --version` | Help and version |
 
+Usage follows the `cs` layout, with aligned aliases and reset countdowns:
+
+```text
+- personal  5h 10% (resets 2h53m) · 7d 94% (resets 1d3h) · idle 13m
+* work      7d 83% (resets 5d11h) · running 1h18m
+```
+
+Window labels come from Codex's reported duration. Accounts with only a weekly
+limit show `7d`. Older cached readings lack that duration and use `primary` or
+`secondary` until refreshed with `cx usage --live`.
+
+Like `cs`, `running` and `idle` measure time since selecting or leaving an
+account, not whether a model request is active. Existing accounts show the label
+without a timer until a selection is recorded. Cached readings older than two
+minutes also show `as of ... ago`.
+
 `cx switch --yes` retains the corresponding `cs` flag. It suppresses the
 unmanaged-session reminder; it never interrupts an active turn.
 
 Native Codex arguments go after `--`. Interactive launches, `resume`, and `fork`
 use the remote TUI transport. There is no `cx run` subcommand. For `codex exec`
 and other noninteractive commands, use Codex directly.
+
+Usage windows are colored in interactive terminals: green below 70%, yellow
+from 70% to below 90%, red from 90%, and bold red at 100% or above. Each window's
+percentage and reset countdown share its color. Piped output stays plain;
+`NO_COLOR=1` or `TERM=dumb` disables colors.
 
 ## Live switching
 
@@ -126,6 +147,8 @@ The Justfile is copied from `cs`, with the binary name changed to `cx`.
 just check                   # formatting, Clippy, tests
 just run list
 just build
+just sync                    # install locally and on mac, no release needed
+just sync another-host       # use another SSH host alias
 
 # Optional installed-Codex protocol smoke test, using synthetic credentials:
 cargo test --test runtime installed_codex_applies_account_changes_without_restarting -- --ignored
@@ -134,6 +157,17 @@ cargo test --test runtime installed_codex_applies_account_changes_without_restar
 Integration tests use temporary homes, local HTTP fixtures, and fake Codex
 subprocesses communicating over real Unix WebSockets. Python 3 is needed for
 the fake subprocess fixture; no third-party Python packages are used.
+
+`just sync` installs the current working tree, including uncommitted changes.
+It copies the binary when OS and architecture match; otherwise it syncs only
+Cargo manifests, the Rust toolchain file, and `src/` into `~/.cache/cx-src` on
+the host and builds there. The remote Cargo build cache is reused. The new
+binary is checked before replacing `~/.local/bin/cx`; credentials and account
+state stay on their own machine. The destination needs SSH and, for a native
+build, rsync and Rust via rustup.
+
+Sync does not bump `Cargo.toml`, commit, push, tag, or create a GitHub release.
+`cx --version` stays at the package version even when you sync newer code.
 
 The copied `just release` recipe commits, tags, and pushes. The release workflow
 builds Linux and macOS binaries for x86_64 and ARM64, then publishes them with
