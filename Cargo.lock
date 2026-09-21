@@ -243,6 +243,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "base64",
+ "cc",
  "chrono",
  "clap",
  "dirs",
@@ -252,6 +253,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "subtle",
  "tempfile",
  "tokio",
  "tokio-tungstenite",

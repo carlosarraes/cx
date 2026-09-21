@@ -19,11 +19,15 @@ libc = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+subtle = "2"
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.28"
 toml = "0.8"
 uuid = { version = "1", features = ["serde"] }
+
+[build-dependencies]
+cc = "1"
 
 [profile.release]
 strip = true

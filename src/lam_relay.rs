@@ -1,5 +1,7 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use subtle::ConstantTimeEq;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::time::{timeout_at, Instant};
@@ -8,8 +10,14 @@ use uuid::Uuid;
 pub const FRAME_LIMIT: usize = 32 * 1024;
 const PROTOCOL_VERSION: u32 = 1;
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct BindingSecret([u8; 32]);
+
+impl BindingSecret {
+    fn matches(&self, candidate: &Self) -> bool {
+        bool::from(self.0.ct_eq(&candidate.0))
+    }
+}
 
 impl<'de> Deserialize<'de> for BindingSecret {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
@@ -78,6 +86,59 @@ impl Request {
         }
         Ok(())
     }
+}
+
+struct BindingRecord {
+    secret: BindingSecret,
+    tui: crate::process::ProcessEvidence,
+}
+
+#[derive(Default)]
+pub struct BindingTable {
+    bindings: HashMap<Uuid, BindingRecord>,
+}
+
+impl BindingTable {
+    pub fn bind(
+        &mut self,
+        thread_id: Uuid,
+        secret: BindingSecret,
+        peer_pid: u32,
+        tui: &crate::process::ProcessEvidence,
+    ) -> Result<()> {
+        tui.validate_descendant(peer_pid)?;
+        if let Some(existing) = self.bindings.get(&thread_id) {
+            existing.tui.validate()?;
+            if existing.tui != *tui || !existing.secret.matches(&secret) {
+                bail!("thread already has a different relay binding");
+            }
+            return Ok(());
+        }
+        self.bindings.insert(
+            thread_id,
+            BindingRecord {
+                secret,
+                tui: tui.clone(),
+            },
+        );
+        Ok(())
+    }
+
+    pub fn authenticate(&self, thread_id: Uuid, secret: &BindingSecret) -> Result<()> {
+        let binding = self
+            .bindings
+            .get(&thread_id)
+            .context("thread has no relay binding")?;
+        binding.tui.validate()?;
+        ensure_secret(binding.secret.matches(secret))
+    }
+}
+
+fn ensure_secret(matches: bool) -> Result<()> {
+    if !matches {
+        bail!("relay binding does not match");
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
@@ -300,5 +361,45 @@ mod tests {
         assert!(json.contains("uncertain"));
         assert!(!json.contains("provider"));
         assert!(!json.contains("private message"));
+    }
+
+    #[test]
+    fn lam_relay_binding_is_exact_idempotent_and_cannot_be_replaced() {
+        let tui = crate::process::ProcessEvidence::read(std::process::id()).unwrap();
+        let thread = Uuid::parse_str(THREAD).unwrap();
+        let first = BindingSecret([0xaa; 32]);
+        let other = BindingSecret([0xbb; 32]);
+        let mut table = BindingTable::default();
+
+        table
+            .bind(thread, first.clone(), std::process::id(), &tui)
+            .unwrap();
+        table
+            .bind(thread, first.clone(), std::process::id(), &tui)
+            .unwrap();
+        assert!(table
+            .bind(thread, other.clone(), std::process::id(), &tui)
+            .is_err());
+        table.authenticate(thread, &first).unwrap();
+        assert!(table.authenticate(thread, &other).is_err());
+    }
+
+    #[test]
+    fn lam_relay_binding_rejects_a_same_user_unrelated_process() {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let child_evidence = crate::process::ProcessEvidence::read(child.id()).unwrap();
+        let result = BindingTable::default().bind(
+            Uuid::parse_str(THREAD).unwrap(),
+            BindingSecret([0xaa; 32]),
+            std::process::id(),
+            &child_evidence,
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(result.is_err());
     }
 }
