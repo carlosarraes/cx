@@ -212,6 +212,7 @@ async fn run_async(paths: Paths, codex: OsString, args: Vec<OsString>) -> Result
         .arg("stdio://")
         .args(["-c", "cli_auth_credentials_store=\"ephemeral\""])
         .env("CODEX_HOME", &paths.codex_home)
+        .env("CX_LAM_RELAY", &lam_socket)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -222,7 +223,6 @@ async fn run_async(paths: Paths, codex: OsString, args: Vec<OsString>) -> Result
         let mut tui = Command::new(&codex).args(&args)
             .arg("--remote").arg(format!("unix://{}", tui_socket.display()))
             .env("CODEX_HOME", &paths.codex_home)
-            .env("CX_LAM_RELAY", &lam_socket)
             .stdin(Stdio::inherit()).stdout(Stdio::inherit()).stderr(Stdio::inherit()).kill_on_drop(true)
             .spawn().context("starting Codex TUI")?;
         let result = async {
@@ -238,8 +238,9 @@ async fn run_async(paths: Paths, codex: OsString, args: Vec<OsString>) -> Result
                 _ = signals.terminate.recv() => return Ok(143),
                 _ = signals.interrupt.recv() => return Ok(130),
             };
-            let tui_evidence = ProcessEvidence::read(tui.id().context("missing Codex TUI process")?)
-                .context("capturing connected Codex TUI process")?;
+            let server_pid = server
+                .id()
+                .context("missing Codex app-server process")?;
             let (tx, rx) = mpsc::channel(16);
             let control_task = tokio::spawn(controls(control_listener, tx));
             let (lam_tx, lam_rx) = mpsc::channel(16);
@@ -254,7 +255,7 @@ async fn run_async(paths: Paths, codex: OsString, args: Vec<OsString>) -> Result
                     alias: initial,
                     account,
                     lam_controls: lam_rx,
-                    tui_evidence,
+                    server_pid,
                 },
                 &mut signals,
             ).await;
@@ -332,7 +333,7 @@ async fn relay(
         alias: initial,
         account: initial_account,
         mut lam_controls,
-        tui_evidence,
+        server_pid,
     } = launch;
     let mut writer = server.stdin.take().context("missing app-server stdin")?;
     let mut lines =
@@ -347,6 +348,7 @@ async fn relay(
     };
     let mut requests = Requests::default();
     let mut relays = RelayState::default();
+    let mut server_evidence = None;
     let mut turns = Turns::default();
     let mut pane_model = PaneModel::default();
     let mut login: Option<Login> = None;
@@ -388,10 +390,22 @@ async fn relay(
                 } else { let _ = control.reply.send(status.clone()); }
             },
             Some(control) = lam_controls.recv() => {
+                if server_evidence.is_none() {
+                    match ProcessEvidence::read(server_pid) {
+                        Ok(evidence) => server_evidence = Some(evidence),
+                        Err(_) => {
+                            let _ = control.reply.send(RelayResponse::error(
+                                ErrorCode::Unavailable,
+                                Submission::NotStarted,
+                            ));
+                            continue;
+                        }
+                    }
+                }
                 start_relay(
                     control,
                     initialized && login.is_none(),
-                    &tui_evidence,
+                    server_evidence.as_ref().expect("captured app-server evidence"),
                     &mut relays,
                     &mut turns,
                     &mut writer,
@@ -440,7 +454,7 @@ async fn relay(
                                 &message,
                                 pending.kind,
                                 &mut relays.bindings,
-                                &tui_evidence,
+                                server_evidence.as_ref().expect("pending relay has app-server evidence"),
                             );
                             if was_queue {
                                 let tracking = if response.accepted() {
@@ -982,7 +996,7 @@ struct Launch {
     alias: String,
     account: Account,
     lam_controls: mpsc::Receiver<RelayControl>,
-    tui_evidence: ProcessEvidence,
+    server_pid: u32,
 }
 struct Signals {
     terminate: tokio::signal::unix::Signal,

@@ -11,6 +11,7 @@ import threading
 import signal
 import socket
 import struct
+import subprocess
 import sys
 import time
 
@@ -23,6 +24,38 @@ relay_binding = "a" * 64
 def log(event):
     with (root / "events").open("a") as f:
         f.write(json.dumps(event) + "\n")
+
+def relay(request):
+    relay_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    relay_socket.connect(os.environ["CX_LAM_RELAY"])
+    raw = json.dumps(request).encode()
+    relay_socket.sendall(struct.pack("!I", len(raw)) + raw)
+    length_bytes = b""
+    while len(length_bytes) < 4:
+        length_bytes += relay_socket.recv(4 - len(length_bytes))
+    length = struct.unpack("!I", length_bytes)[0]
+    response = b""
+    while len(response) < length:
+        response += relay_socket.recv(length - len(response))
+    relay_socket.close()
+    return json.loads(response)
+
+if "relay-helper" in sys.argv:
+    (root / "relay_path").write_text(os.environ["CX_LAM_RELAY"])
+    log({"relay_bind": relay({
+        "version": 1,
+        "operation": "bind",
+        "thread_id": relay_thread,
+        "binding": relay_binding,
+    })})
+    if scenario == "lam-conflict":
+        log({"relay_conflict": relay({
+            "version": 1,
+            "operation": "bind",
+            "thread_id": relay_thread,
+            "binding": "b" * 64,
+        })})
+    sys.exit(0)
 
 if "app-server" in sys.argv:
     log({"server_pid": os.getpid(), "server_has_relay": "CX_LAM_RELAY" in os.environ})
@@ -109,7 +142,8 @@ if "app-server" in sys.argv:
                 pending = msg
                 (root / "busy").touch()
             elif method == "initialized":
-                pass
+                if scenario.startswith("lam-"):
+                    subprocess.Popen([sys.executable, __file__, "relay-helper"])
         if held_login and (root / "auth_release").exists():
             send({"id": held_login["id"], "result": {"type": "chatgptAuthTokens"}})
             held_login = None
@@ -122,7 +156,7 @@ if "app-server" in sys.argv:
             send({"method": "turn/completed", "params": {"threadId": "thread-a", "turn": {"id": "turn-1", "items": [], "status": "completed", "error": None}}})
     sys.exit(0)
 
-log({"tui_pid": os.getpid(), "args": sys.argv[1:]})
+log({"tui_pid": os.getpid(), "args": sys.argv[1:], "tui_has_relay": "CX_LAM_RELAY" in os.environ})
 signal.signal(signal.SIGINT, lambda *_: (root / "interrupted").touch())
 if scenario == "startup":
     time.sleep(60)
@@ -167,21 +201,6 @@ def receive():
         length = struct.unpack("!Q", exact(8))[0]
     return json.loads(exact(length))
 
-def relay(request):
-    relay_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    relay_socket.connect(os.environ["CX_LAM_RELAY"])
-    raw = json.dumps(request).encode()
-    relay_socket.sendall(struct.pack("!I", len(raw)) + raw)
-    length_bytes = b""
-    while len(length_bytes) < 4:
-        length_bytes += relay_socket.recv(4 - len(length_bytes))
-    length = struct.unpack("!I", length_bytes)[0]
-    response = b""
-    while len(response) < length:
-        response += relay_socket.recv(length - len(response))
-    relay_socket.close()
-    return json.loads(response)
-
 send({"id": "cx.auth.1", "method": "initialize", "params": {"clientInfo": {"name": "codex_cli_rs", "version": "0.154.0"}, "capabilities": {"experimentalApi": False}}})
 assert receive()["id"] == "cx.auth.1"
 send({"method": "initialized"})
@@ -192,21 +211,6 @@ while True:
         assert msg["result"]["data"] == []
         break
 (root / "ready").touch()
-if scenario.startswith("lam-"):
-    (root / "relay_path").write_text(os.environ["CX_LAM_RELAY"])
-    log({"relay_bind": relay({
-        "version": 1,
-        "operation": "bind",
-        "thread_id": relay_thread,
-        "binding": relay_binding,
-    })})
-    if scenario == "lam-conflict":
-        log({"relay_conflict": relay({
-            "version": 1,
-            "operation": "bind",
-            "thread_id": relay_thread,
-            "binding": "b" * 64,
-        })})
 if scenario == "model-isolation":
     send({"id": 29, "method": "thread/settings/update", "params": {"threadId": "thread-a", "model": "gpt-5.6-luna", "effort": "high"}})
     while receive().get("id") != 29:

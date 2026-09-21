@@ -173,7 +173,11 @@ fn lam_relay_binds_inspects_and_queues_the_exact_thread() {
     assert!(f
         .events()
         .iter()
-        .any(|event| event["server_has_relay"] == false));
+        .any(|event| event["server_has_relay"] == true));
+    assert!(f
+        .events()
+        .iter()
+        .any(|event| event["tui_has_relay"] == false));
 
     let inspect = f.relay(json!({
         "version": 1,

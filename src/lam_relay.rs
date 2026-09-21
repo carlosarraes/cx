@@ -93,7 +93,7 @@ impl Request {
 
 struct BindingRecord {
     secret: BindingSecret,
-    tui: crate::process::ProcessEvidence,
+    server: crate::process::ProcessEvidence,
 }
 
 #[derive(Default)]
@@ -107,12 +107,12 @@ impl BindingTable {
         thread_id: Uuid,
         secret: BindingSecret,
         peer_pid: u32,
-        tui: &crate::process::ProcessEvidence,
+        server: &crate::process::ProcessEvidence,
     ) -> Result<()> {
-        tui.validate_descendant(peer_pid)?;
+        server.validate_descendant(peer_pid)?;
         if let Some(existing) = self.bindings.get(&thread_id) {
-            existing.tui.validate()?;
-            if existing.tui != *tui || !existing.secret.matches(&secret) {
+            existing.server.validate()?;
+            if existing.server != *server || !existing.secret.matches(&secret) {
                 bail!("thread already has a different relay binding");
             }
             return Ok(());
@@ -121,7 +121,7 @@ impl BindingTable {
             thread_id,
             BindingRecord {
                 secret,
-                tui: tui.clone(),
+                server: server.clone(),
             },
         );
         Ok(())
@@ -132,7 +132,7 @@ impl BindingTable {
             .bindings
             .get(&thread_id)
             .context("thread has no relay binding")?;
-        binding.tui.validate()?;
+        binding.server.validate()?;
         ensure_secret(binding.secret.matches(secret))
     }
 }
