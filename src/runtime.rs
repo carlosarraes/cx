@@ -17,6 +17,7 @@ use std::{
     collections::{HashMap, VecDeque},
     ffi::OsString,
     fs,
+    io::{Read, Seek, SeekFrom},
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Stdio,
@@ -182,6 +183,25 @@ async fn stop(child: &mut Child) {
     let _ = child.wait().await;
 }
 
+fn report_app_server_error(log: &mut fs::File) {
+    let Ok(size) = log.metadata().map(|metadata| metadata.len()) else {
+        return;
+    };
+    if log
+        .seek(SeekFrom::Start(size.saturating_sub(8192)))
+        .is_err()
+    {
+        return;
+    }
+    let mut bytes = Vec::new();
+    if log.read_to_end(&mut bytes).is_ok() && !bytes.is_empty() {
+        eprintln!(
+            "Codex app-server stderr:\n{}",
+            String::from_utf8_lossy(&bytes).trim()
+        );
+    }
+}
+
 async fn run_async(paths: Paths, codex: OsString, args: Vec<OsString>) -> Result<i32> {
     let mut signals = Signals::new()?;
     let store = Store::new(paths.clone());
@@ -209,6 +229,7 @@ async fn run_async(paths: Paths, codex: OsString, args: Vec<OsString>) -> Result
         UnixListener::bind(&control_path).context("binding cx control socket")?;
     fs::set_permissions(&control_path, fs::Permissions::from_mode(0o600))?;
     let _socket_cleanup = SocketCleanup(control_path);
+    let mut server_stderr = tempfile::tempfile()?;
     let mut server = Command::new(&codex)
         .arg("app-server")
         .process_group(0)
@@ -219,7 +240,7 @@ async fn run_async(paths: Paths, codex: OsString, args: Vec<OsString>) -> Result
         .env("CX_LAM_RELAY", &lam_socket)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::from(server_stderr.try_clone()?))
         .kill_on_drop(true)
         .spawn()
         .context("starting Codex app-server (set CX_CODEX_BIN to select a binary)")?;
@@ -277,6 +298,9 @@ async fn run_async(paths: Paths, codex: OsString, args: Vec<OsString>) -> Result
         }
     }
     stop(&mut server).await;
+    if outcome.is_err() {
+        report_app_server_error(&mut server_stderr);
+    }
     outcome
 }
 

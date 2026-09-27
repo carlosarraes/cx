@@ -418,6 +418,35 @@ fn bare_cx_keeps_same_children_when_switching_an_idle_session() {
 }
 
 #[test]
+fn app_server_warnings_do_not_write_over_the_tui() {
+    let mut f = Fixture::new("server-warning");
+    f.wait(|f| f.dir.path().join("ready").exists());
+    f.touch("emit_warning");
+    f.wait(|f| f.dir.path().join("warning_emitted").exists());
+    assert!(f.finish().success());
+    let stderr = fs::read_to_string(f.dir.path().join("stderr")).unwrap();
+    assert!(
+        !stderr.contains("cx-test-app-server-startup-warning"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("cx-test-app-server-late-warning"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn app_server_errors_are_reported_after_the_tui_stops() {
+    let mut f = Fixture::new("server-error");
+    assert!(!f.finish().success());
+    let stderr = fs::read_to_string(f.dir.path().join("stderr")).unwrap();
+    assert!(
+        stderr.contains("cx-test-app-server-fatal-error"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn model_selection_does_not_write_shared_config() {
     let mut f = Fixture::new("model-isolation");
     f.wait(|f| {

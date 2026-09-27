@@ -59,6 +59,11 @@ if "relay-helper" in sys.argv:
 
 if "app-server" in sys.argv:
     log({"server_pid": os.getpid(), "server_has_relay": "CX_LAM_RELAY" in os.environ})
+    if scenario == "server-warning":
+        print("cx-test-app-server-startup-warning", file=sys.stderr, flush=True)
+    if scenario == "server-error":
+        print("cx-test-app-server-fatal-error", file=sys.stderr, flush=True)
+        sys.exit(1)
     if scenario == "actual":
         os.execvp("codex", ["codex"] + sys.argv[1:])
     pending = None
@@ -74,6 +79,9 @@ if "app-server" in sys.argv:
         incoming.put("")
     threading.Thread(target=reader, daemon=True).start()
     while True:
+        if scenario == "server-warning" and (root / "emit_warning").exists() and not (root / "warning_emitted").exists():
+            print("cx-test-app-server-late-warning", file=sys.stderr, flush=True)
+            (root / "warning_emitted").touch()
         try:
             line = incoming.get(timeout=0.02)
         except queue.Empty:
