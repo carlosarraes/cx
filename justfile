@@ -37,7 +37,7 @@ sync host="mac": build
     else
         echo "$sync_host is $remote; syncing source and building there"
         rsync -az --delete \
-            --include='/Cargo.toml' --include='/Cargo.lock' \
+            --include='/Cargo.toml' --include='/Cargo.lock' --include='/build.rs' \
             --include='/rust-toolchain.toml' --include='/src/***' \
             --exclude='*' -e 'ssh -o BatchMode=yes' ./ "$sync_host":.cache/cx-src/
         ssh -o BatchMode=yes "$sync_host" 'export PATH="$HOME/.cargo/bin:$PATH"; cd ~/.cache/cx-src && cargo build --locked --release'
