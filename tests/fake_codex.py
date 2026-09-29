@@ -11,54 +11,17 @@ import threading
 import signal
 import socket
 import struct
-import subprocess
 import sys
 import time
 
 root = Path(os.environ["CX_TEST_DIR"])
 scenario = os.environ.get("CX_TEST_SCENARIO", "idle")
-relay_thread = "11111111-1111-4111-8111-111111111111"
-relay_attempt_receipt = "33333333-3333-4333-8333-333333333333"
-relay_binding = "a" * 64
-
 def log(event):
     with (root / "events").open("a") as f:
         f.write(json.dumps(event) + "\n")
 
-def relay(request):
-    relay_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    relay_socket.connect(os.environ["CX_LAM_RELAY"])
-    raw = json.dumps(request).encode()
-    relay_socket.sendall(struct.pack("!I", len(raw)) + raw)
-    length_bytes = b""
-    while len(length_bytes) < 4:
-        length_bytes += relay_socket.recv(4 - len(length_bytes))
-    length = struct.unpack("!I", length_bytes)[0]
-    response = b""
-    while len(response) < length:
-        response += relay_socket.recv(length - len(response))
-    relay_socket.close()
-    return json.loads(response)
-
-if "relay-helper" in sys.argv:
-    (root / "relay_path").write_text(os.environ["CX_LAM_RELAY"])
-    log({"relay_bind": relay({
-        "version": 1,
-        "operation": "bind",
-        "thread_id": relay_thread,
-        "binding": relay_binding,
-    })})
-    if scenario == "lam-conflict":
-        log({"relay_conflict": relay({
-            "version": 1,
-            "operation": "bind",
-            "thread_id": relay_thread,
-            "binding": "b" * 64,
-        })})
-    sys.exit(0)
-
 if "app-server" in sys.argv:
-    log({"server_pid": os.getpid(), "server_has_relay": "CX_LAM_RELAY" in os.environ})
+    log({"server_pid": os.getpid()})
     if scenario == "server-warning":
         print("cx-test-app-server-startup-warning", file=sys.stderr, flush=True)
     if scenario == "server-error":
@@ -113,27 +76,6 @@ if "app-server" in sys.argv:
                 model = msg["params"].get("model", "gpt-5.6-sol")
                 effort = msg["params"].get("config", {}).get("model_reasoning_effort", "low")
                 send({"id": msg["id"], "result": {"thread": {"id": "thread-a", "preview": "", "ephemeral": False, "modelProvider": "openai", "createdAt": 0, "updatedAt": 0, "status": {"type": "idle"}, "path": "/tmp/thread.jsonl", "cwd": "/tmp", "cliVersion": "0.155.1", "source": "cli", "agentPath": "root", "name": None, "turns": []}, "model": model, "modelProvider": "openai", "serviceTier": None, "cwd": "/tmp", "approvalPolicy": "never", "approvalsReviewer": "user", "sandbox": {"type": "dangerFullAccess"}, "reasoningEffort": effort}})
-            elif method == "thread/read":
-                thread_id = msg["params"]["threadId"]
-                if scenario == "lam-wrong-thread" and str(msg["id"]).startswith("cx.lam."):
-                    thread_id = "44444444-4444-4444-8444-444444444444"
-                send({"id": msg["id"], "result": {"thread": {"id": thread_id, "status": {"type": "idle"}, "canAcceptDirectInput": True}}})
-            elif method == "thread/queue/add":
-                params = msg["params"]
-                log({"relay_queue": params})
-                if scenario == "lam-queue-drop":
-                    pass
-                elif scenario == "lam-queue-error":
-                    send({"id": msg["id"], "error": {"code": -32000, "message": "provider-private-text"}})
-                else:
-                    queued = {"id": relay_attempt_receipt, "clientUserMessageId": params["clientUserMessageId"], "input": params["input"]}
-                    if scenario == "lam-missing-receipt":
-                        queued.pop("id")
-                    if scenario == "lam-wrong-attempt":
-                        queued["clientUserMessageId"] = "55555555-5555-4555-8555-555555555555"
-                    send({"id": msg["id"], "result": {"queuedSubmission": queued}})
-                    send({"method": "turn/started", "params": {"threadId": params["threadId"], "turn": {"id": "relay-turn", "items": [], "status": "inProgress", "error": None}}})
-                    send({"method": "turn/completed", "params": {"threadId": params["threadId"], "turn": {"id": "relay-turn", "items": [], "status": "completed", "error": None}}})
             elif method == "config/batchWrite":
                 keys = [edit["keyPath"] for edit in msg["params"]["edits"]]
                 log({"config_write": keys})
@@ -149,9 +91,6 @@ if "app-server" in sys.argv:
             elif method in ["turn/start", "review/start", "thread/compact/start", "thread/queue/start"]:
                 pending = msg
                 (root / "busy").touch()
-            elif method == "initialized":
-                if scenario.startswith("lam-"):
-                    subprocess.Popen([sys.executable, __file__, "relay-helper"])
         if held_login and (root / "auth_release").exists():
             send({"id": held_login["id"], "result": {"type": "chatgptAuthTokens"}})
             held_login = None
@@ -164,7 +103,7 @@ if "app-server" in sys.argv:
             send({"method": "turn/completed", "params": {"threadId": "thread-a", "turn": {"id": "turn-1", "items": [], "status": "completed", "error": None}}})
     sys.exit(0)
 
-log({"tui_pid": os.getpid(), "args": sys.argv[1:], "tui_has_relay": "CX_LAM_RELAY" in os.environ})
+log({"tui_pid": os.getpid(), "args": sys.argv[1:]})
 signal.signal(signal.SIGINT, lambda *_: (root / "interrupted").touch())
 if scenario == "startup":
     time.sleep(60)
@@ -263,13 +202,9 @@ if scenario == "clear-model-isolation":
             config = msg["result"]["config"]
             log({"clear_defaults": {"model": config.get("model"), "effort": config.get("model_reasoning_effort")}})
             break
-if scenario in ["turn/start", "review/start", "thread/compact/start", "thread/queue/start", "lam-busy"]:
-    method = "turn/start" if scenario == "lam-busy" else scenario
+if scenario in ["turn/start", "review/start", "thread/compact/start", "thread/queue/start"]:
+    method = scenario
     send({"id": 8, "method": method, "params": {"threadId": "thread-a"}})
-    if scenario == "lam-busy":
-        while receive().get("id") != 8:
-            pass
-        (root / "native_busy_ready").touch()
 while not (root / "quit").exists():
     if scenario == "actual":
         send({"id": "read-account", "method": "account/read", "params": {"refreshToken": False}})
@@ -279,7 +214,5 @@ while not (root / "quit").exists():
         if msg.get("id") == "read-account":
             log({"actual_email": msg["result"]["account"]["email"]})
             time.sleep(0.05)
-        elif str(msg.get("id", "")).startswith("cx.lam."):
-            log({"relay_response_leaked_to_tui": msg["id"]})
 s.sendall(bytes([0x88, 0x80]) + os.urandom(4))
 s.close()

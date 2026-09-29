@@ -1,11 +1,6 @@
 //! One native Codex app-server/TUI pair, controlled over private Unix sockets.
 use crate::{
     auth,
-    lam_relay::{
-        self, BindingSecret, BindingTable, ErrorCode, RelayControl, Request as RelayRequest,
-        Response as RelayResponse, Submission, ThreadState,
-    },
-    process::ProcessEvidence,
     protocol::{starts_turn, Requests, Turns},
     state::{Account, Paths, Store},
 };
@@ -14,7 +9,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     ffi::OsString,
     fs,
     io::{Read, Seek, SeekFrom},
@@ -218,9 +213,6 @@ async fn run_async(paths: Paths, codex: OsString, args: Vec<OsString>) -> Result
         .context("resolving private cx transport directory")?;
     let tui_socket = transport_path.join("tui.sock");
     let listener = UnixListener::bind(&tui_socket)?;
-    let lam_socket = transport_path.join("lam.sock");
-    let lam_listener = UnixListener::bind(&lam_socket).context("binding LAM relay socket")?;
-    fs::set_permissions(&lam_socket, fs::Permissions::from_mode(0o600))?;
     let directory = paths.data.join("runtimes");
     fs::create_dir_all(&directory)?;
     fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
@@ -237,7 +229,6 @@ async fn run_async(paths: Paths, codex: OsString, args: Vec<OsString>) -> Result
         .arg("stdio://")
         .args(["-c", "cli_auth_credentials_store=\"ephemeral\""])
         .env("CODEX_HOME", &paths.codex_home)
-        .env("CX_LAM_RELAY", &lam_socket)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::from(server_stderr.try_clone()?))
@@ -263,13 +254,8 @@ async fn run_async(paths: Paths, codex: OsString, args: Vec<OsString>) -> Result
                 _ = signals.terminate.recv() => return Ok(143),
                 _ = signals.interrupt.recv() => return Ok(130),
             };
-            let server_pid = server
-                .id()
-                .context("missing Codex app-server process")?;
             let (tx, rx) = mpsc::channel(16);
             let control_task = tokio::spawn(controls(control_listener, tx));
-            let (lam_tx, lam_rx) = mpsc::channel(16);
-            let lam_task = tokio::spawn(lam_relay::serve(lam_listener, lam_tx));
             let result = relay(
                 &mut server,
                 &mut tui,
@@ -279,13 +265,10 @@ async fn run_async(paths: Paths, codex: OsString, args: Vec<OsString>) -> Result
                     store,
                     alias: initial,
                     account,
-                    lam_controls: lam_rx,
-                    server_pid,
                 },
                 &mut signals,
             ).await;
             control_task.abort();
-            lam_task.abort();
             result
         }.await;
         stop(&mut tui).await;
@@ -319,35 +302,6 @@ struct Login {
     started: Instant,
 }
 
-enum PendingRelayKind {
-    Bind {
-        thread_id: uuid::Uuid,
-        secret: BindingSecret,
-        peer_pid: u32,
-    },
-    Inspect {
-        thread_id: uuid::Uuid,
-    },
-    Queue {
-        thread_id: uuid::Uuid,
-        attempt_id: uuid::Uuid,
-        input: Value,
-    },
-}
-
-struct PendingRelay {
-    kind: PendingRelayKind,
-    reply: oneshot::Sender<RelayResponse>,
-    deadline: Instant,
-}
-
-#[derive(Default)]
-struct RelayState {
-    bindings: BindingTable,
-    serial: u64,
-    pending: HashMap<String, PendingRelay>,
-}
-
 async fn relay(
     server: &mut Child,
     tui: &mut Child,
@@ -360,8 +314,6 @@ async fn relay(
         store,
         alias: initial,
         account: initial_account,
-        mut lam_controls,
-        server_pid,
     } = launch;
     let mut writer = server.stdin.take().context("missing app-server stdin")?;
     let mut lines =
@@ -375,8 +327,6 @@ async fn relay(
         error: None,
     };
     let mut requests = Requests::default();
-    let mut relays = RelayState::default();
-    let mut server_evidence = None;
     let mut turns = Turns::default();
     let mut pane_model = PaneModel::default();
     let mut login: Option<Login> = None;
@@ -401,7 +351,6 @@ async fn relay(
                 if login.as_ref().is_some_and(|l| l.started.elapsed() > DEADLINE) {
                     bail!("Codex account change timed out; runtime stopped to avoid using an uncertain account");
                 }
-                expire_relays(&mut relays.pending, &mut turns);
             },
             Some(control) = controls.recv() => {
                 if control.action == "switch" {
@@ -416,28 +365,6 @@ async fn relay(
                         Err(_) => { status.error=Some("could not read selected account".into()); let _ = control.reply.send(status.clone()); }
                     }
                 } else { let _ = control.reply.send(status.clone()); }
-            },
-            Some(control) = lam_controls.recv() => {
-                if server_evidence.is_none() {
-                    match ProcessEvidence::read(server_pid) {
-                        Ok(evidence) => server_evidence = Some(evidence),
-                        Err(_) => {
-                            let _ = control.reply.send(RelayResponse::error(
-                                ErrorCode::Unavailable,
-                                Submission::NotStarted,
-                            ));
-                            continue;
-                        }
-                    }
-                }
-                start_relay(
-                    control,
-                    initialized && login.is_none(),
-                    server_evidence.as_ref().expect("captured app-server evidence"),
-                    &mut relays,
-                    &mut turns,
-                    &mut writer,
-                ).await;
             },
             frame = socket.next() => {
                 match frame {
@@ -473,30 +400,6 @@ async fn relay(
                             send(&mut writer, &json!({"id":id,"result":params})).await?;
                         }
                         Err(_) => { send(&mut writer, &json!({"id":id,"error":{"code":-32000,"message":"cx could not refresh this account; sign in again with cx add <alias> --force"}})).await?; }
-                    }
-                } else if message["id"].as_str().is_some_and(|id| id.starts_with("cx.lam.")) {
-                    if let Some(id) = message["id"].as_str().map(str::to_owned) {
-                        if let Some(pending) = relays.pending.remove(&id) {
-                            let was_queue = matches!(&pending.kind, PendingRelayKind::Queue { .. });
-                            let response = finish_relay(
-                                &message,
-                                pending.kind,
-                                &mut relays.bindings,
-                                server_evidence.as_ref().expect("pending relay has app-server evidence"),
-                            );
-                            if was_queue {
-                                let tracking = if response.accepted() {
-                                    message.clone()
-                                } else {
-                                    json!({"id":id,"error":{"code":-32000}})
-                                };
-                                turns.start_response(&id, &tracking);
-                                if response.accepted() {
-                                    debug_assert!(turns.busy(), "accepted queue must reserve the turn gap");
-                                }
-                            }
-                            let _ = pending.reply.send(response);
-                        }
                     }
                 } else if login.as_ref().is_some_and(|l| message["id"].as_str() == Some(&l.id)) {
                     let completed=login.take().unwrap();
@@ -539,7 +442,7 @@ async fn relay(
                 }
             }
         }
-        if initialized && login.is_none() && !turns.busy() && relays.pending.is_empty() {
+        if initialized && login.is_none() && !turns.busy() {
             if let Some(alias) = status.pending.clone() {
                 match credentials(&store, &alias, false).await {
                     Ok(account) => {
@@ -600,243 +503,6 @@ async fn relay(
                 .await?;
             }
         }
-    }
-}
-
-async fn start_relay(
-    control: RelayControl,
-    ready: bool,
-    tui: &ProcessEvidence,
-    relays: &mut RelayState,
-    turns: &mut Turns,
-    writer: &mut ChildStdin,
-) {
-    let RelayControl {
-        request,
-        peer_pid,
-        deadline,
-        reply,
-    } = control;
-    if !ready {
-        let _ = reply.send(RelayResponse::error(
-            ErrorCode::Unavailable,
-            Submission::NotStarted,
-        ));
-        return;
-    }
-
-    let (kind, request, queue) = match request {
-        RelayRequest::Bind {
-            thread_id, binding, ..
-        } => {
-            if tui.validate_descendant(peer_pid).is_err() {
-                let _ = reply.send(RelayResponse::error(
-                    ErrorCode::Unauthorized,
-                    Submission::NotStarted,
-                ));
-                return;
-            }
-            (
-                PendingRelayKind::Bind {
-                    thread_id,
-                    secret: binding,
-                    peer_pid,
-                },
-                json!({"method":"thread/read","params":{"threadId":thread_id,"includeTurns":false}}),
-                false,
-            )
-        }
-        RelayRequest::Inspect {
-            thread_id, binding, ..
-        } => {
-            if relays.bindings.authenticate(thread_id, &binding).is_err() {
-                let _ = reply.send(RelayResponse::error(
-                    ErrorCode::Unauthorized,
-                    Submission::NotStarted,
-                ));
-                return;
-            }
-            if turns.busy() {
-                let _ = reply.send(RelayResponse::inspected(ThreadState::Active));
-                return;
-            }
-            (
-                PendingRelayKind::Inspect { thread_id },
-                json!({"method":"thread/read","params":{"threadId":thread_id,"includeTurns":false}}),
-                false,
-            )
-        }
-        RelayRequest::Queue {
-            thread_id,
-            binding,
-            attempt_id,
-            text,
-            ..
-        } => {
-            if relays.bindings.authenticate(thread_id, &binding).is_err() {
-                let _ = reply.send(RelayResponse::error(
-                    ErrorCode::Unauthorized,
-                    Submission::NotStarted,
-                ));
-                return;
-            }
-            if turns.busy() {
-                let _ = reply.send(RelayResponse::error(
-                    ErrorCode::Unavailable,
-                    Submission::NotStarted,
-                ));
-                return;
-            }
-            let input = json!([{"type":"text","text":text,"text_elements":[]}]);
-            (
-                PendingRelayKind::Queue {
-                    thread_id,
-                    attempt_id,
-                    input: input.clone(),
-                },
-                json!({"method":"thread/queue/add","params":{
-                    "threadId":thread_id,
-                    "clientUserMessageId":attempt_id,
-                    "input":input
-                }}),
-                true,
-            )
-        }
-    };
-
-    relays.serial = relays.serial.saturating_add(1);
-    let id = format!("cx.lam.{}", relays.serial);
-    let mut request = request;
-    request["id"] = json!(id);
-    if queue {
-        if let PendingRelayKind::Queue { thread_id, .. } = &kind {
-            turns.starting(&id, &thread_id.to_string());
-        }
-    }
-    relays.pending.insert(
-        id.clone(),
-        PendingRelay {
-            kind,
-            reply,
-            deadline,
-        },
-    );
-
-    if !matches!(
-        tokio::time::timeout_at(deadline, send(writer, &request)).await,
-        Ok(Ok(()))
-    ) {
-        if let Some(failed) = relays.pending.remove(&id) {
-            if queue {
-                turns.start_response(&id, &json!({"id":id,"error":{"code":-32000}}));
-            }
-            let _ = failed.reply.send(RelayResponse::error(
-                ErrorCode::UpstreamError,
-                if queue {
-                    Submission::Uncertain
-                } else {
-                    Submission::NotStarted
-                },
-            ));
-        }
-    }
-}
-
-fn finish_relay(
-    message: &Value,
-    kind: PendingRelayKind,
-    bindings: &mut BindingTable,
-    tui: &ProcessEvidence,
-) -> RelayResponse {
-    let queue = matches!(&kind, PendingRelayKind::Queue { .. });
-    let submission = if queue {
-        Submission::Uncertain
-    } else {
-        Submission::NotStarted
-    };
-    if message.get("error").is_some() {
-        return RelayResponse::error(ErrorCode::UpstreamError, submission);
-    }
-
-    match kind {
-        PendingRelayKind::Bind {
-            thread_id,
-            secret,
-            peer_pid,
-        } => {
-            let expected = thread_id.to_string();
-            if message.pointer("/result/thread/id").and_then(Value::as_str)
-                != Some(expected.as_str())
-            {
-                return RelayResponse::error(ErrorCode::ThreadMismatch, submission);
-            }
-            match bindings.bind(thread_id, secret, peer_pid, tui) {
-                Ok(()) => RelayResponse::bound(),
-                Err(_) => RelayResponse::error(ErrorCode::Conflict, submission),
-            }
-        }
-        PendingRelayKind::Inspect { thread_id } => {
-            let expected = thread_id.to_string();
-            if message.pointer("/result/thread/id").and_then(Value::as_str)
-                != Some(expected.as_str())
-            {
-                return RelayResponse::error(ErrorCode::ThreadMismatch, submission);
-            }
-            if message.pointer("/result/thread/canAcceptDirectInput") == Some(&Value::Bool(false)) {
-                return RelayResponse::error(ErrorCode::Unavailable, submission);
-            }
-            match message
-                .pointer("/result/thread/status/type")
-                .and_then(Value::as_str)
-            {
-                Some("idle") => RelayResponse::inspected(ThreadState::Idle),
-                Some("active") => RelayResponse::inspected(ThreadState::Active),
-                _ => RelayResponse::error(ErrorCode::UpstreamError, submission),
-            }
-        }
-        PendingRelayKind::Queue {
-            thread_id: _,
-            attempt_id,
-            input,
-        } => {
-            let queued = &message["result"]["queuedSubmission"];
-            let receipt = queued["id"]
-                .as_str()
-                .and_then(|id| uuid::Uuid::parse_str(id).ok());
-            let expected = attempt_id.to_string();
-            if queued["clientUserMessageId"].as_str() != Some(expected.as_str())
-                || queued["input"] != input
-                || receipt.is_none()
-            {
-                return RelayResponse::error(ErrorCode::UpstreamError, submission);
-            }
-            RelayResponse::queued(receipt.expect("checked receipt"))
-        }
-    }
-}
-
-fn expire_relays(pending: &mut HashMap<String, PendingRelay>, turns: &mut Turns) {
-    let now = Instant::now();
-    let expired: Vec<_> = pending
-        .iter()
-        .filter_map(|(id, relay)| (relay.deadline <= now).then_some(id.clone()))
-        .collect();
-    for id in expired {
-        let Some(relay) = pending.remove(&id) else {
-            continue;
-        };
-        let queue = matches!(&relay.kind, PendingRelayKind::Queue { .. });
-        if queue {
-            turns.start_response(&id, &json!({"id":id,"error":{"code":-32000}}));
-        }
-        let _ = relay.reply.send(RelayResponse::error(
-            ErrorCode::Timeout,
-            if queue {
-                Submission::Uncertain
-            } else {
-                Submission::NotStarted
-            },
-        ));
     }
 }
 
@@ -1034,8 +700,6 @@ struct Launch {
     store: Store,
     alias: String,
     account: Account,
-    lam_controls: mpsc::Receiver<RelayControl>,
-    server_pid: u32,
 }
 struct Signals {
     terminate: tokio::signal::unix::Signal,
