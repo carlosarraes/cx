@@ -230,9 +230,20 @@ fn execute(cli: Cli) -> Result<i32> {
                 }
             }
             let state = store.read()?;
+            let sessions = if live {
+                let reports = runtime::sessions(&paths).unwrap_or_default();
+                usage::count_sessions(
+                    reports
+                        .iter()
+                        .filter_map(|r| r.account.as_deref().map(|a| (a, r.pending.is_some()))),
+                )
+            } else {
+                Default::default()
+            };
             for line in usage::format_lines_colored(
                 &state,
                 chrono::Utc::now().timestamp(),
+                &sessions,
                 usage::colors_enabled(),
             ) {
                 println!("{line}");

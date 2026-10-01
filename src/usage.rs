@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -122,10 +123,44 @@ pub fn choose_next(state: &State) -> Result<String> {
 
 /// Uses the same selection-based activity timers and layout as cs.
 pub fn format_lines(state: &State, now: i64) -> Vec<String> {
-    format_lines_colored(state, now, false)
+    format_lines_colored(state, now, &BTreeMap::new(), false)
 }
 
-pub fn format_lines_colored(state: &State, now: i64, color: bool) -> Vec<String> {
+/// Live sessions on one account; `leaving` of them have a switch pending.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct SessionCount {
+    pub active: usize,
+    pub leaving: usize,
+}
+
+/// Tally `(account, has_pending_switch)` pairs per account.
+pub fn count_sessions<'a>(
+    sessions: impl IntoIterator<Item = (&'a str, bool)>,
+) -> BTreeMap<String, SessionCount> {
+    let mut counts = BTreeMap::<String, SessionCount>::new();
+    for (account, pending) in sessions {
+        let c = counts.entry(account.to_string()).or_default();
+        c.active += 1;
+        c.leaving += usize::from(pending);
+    }
+    counts
+}
+
+/// `(5)`, `(4 →)` when all are switching away, `(5, 2 →)` when some are.
+fn format_sessions(c: SessionCount) -> String {
+    match c.leaving {
+        0 => format!("({})", c.active),
+        n if n == c.active => format!("({n} →)"),
+        n => format!("({}, {n} →)", c.active),
+    }
+}
+
+pub fn format_lines_colored(
+    state: &State,
+    now: i64,
+    sessions: &BTreeMap<String, SessionCount>,
+    color: bool,
+) -> Vec<String> {
     let width = state.accounts.keys().map(String::len).max().unwrap_or(0);
     state
         .accounts
@@ -168,10 +203,14 @@ pub fn format_lines_colored(state: &State, now: i64, color: bool) -> Vec<String>
             } else {
                 ("idle", state.last_active_at.get(alias).copied())
             };
-            parts.push(match since {
+            let mut activity = match since {
                 Some(since) => format!("{activity} {}", format_duration(now.saturating_sub(since))),
                 None => activity.into(),
-            });
+            };
+            if let Some(c) = sessions.get(alias).filter(|c| c.active > 0) {
+                activity = format!("{activity} {}", format_sessions(*c));
+            }
+            parts.push(activity);
             if let Some(usage) = &account.usage {
                 let age = now.saturating_sub(usage.observed_at);
                 if age > 120 {
@@ -240,6 +279,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn usage_shows_live_sessions_and_pending_switches() {
+        let mut obs = State::default();
+        for alias in ["a", "b", "c", "d"] {
+            obs.accounts.insert(
+                alias.into(),
+                serde_json::from_value(serde_json::json!({
+                    "email": "fixture@example.test", "account_id": alias, "data": {}
+                }))
+                .unwrap(),
+            );
+        }
+        let sessions = count_sessions([
+            ("a", true),
+            ("a", true),
+            ("b", false),
+            ("b", false),
+            ("b", true),
+            ("c", false),
+        ]);
+        let lines = format_lines_colored(&obs, 0, &sessions, false);
+        assert!(lines[0].ends_with("idle (2 →)"), "{}", lines[0]);
+        assert!(lines[1].ends_with("idle (3, 1 →)"), "{}", lines[1]);
+        assert!(lines[2].ends_with("idle (1)"), "{}", lines[2]);
+        assert!(lines[3].ends_with("idle"), "{}", lines[3]);
+    }
+
+    #[test]
     fn usage_colors_each_window_by_its_own_quota() {
         let mut obs = State::default();
         for (alias, percent) in [("a", 69.0), ("b", 70.0), ("c", 90.0), ("d", 100.0)] {
@@ -250,7 +316,7 @@ mod tests {
             })).unwrap());
         }
 
-        let lines = format_lines_colored(&obs, 0, true);
+        let lines = format_lines_colored(&obs, 0, &BTreeMap::new(), true);
         for (line, (code, percent)) in
             lines
                 .iter()
@@ -263,7 +329,7 @@ mod tests {
             assert!(!line.starts_with('\x1b'), "only windows should be colored");
         }
         assert!(lines[0].contains("\x1b[1;31m7d 100% (resets 3d11h)\x1b[0m"));
-        assert!(format_lines_colored(&obs, 0, false)
+        assert!(format_lines_colored(&obs, 0, &BTreeMap::new(), false)
             .iter()
             .all(|line| !line.contains('\x1b')));
     }
