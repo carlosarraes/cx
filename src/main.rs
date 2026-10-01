@@ -232,11 +232,11 @@ fn execute(cli: Cli) -> Result<i32> {
             let state = store.read()?;
             let sessions = if live {
                 let reports = runtime::sessions(&paths).unwrap_or_default();
-                usage::count_sessions(
-                    reports
-                        .iter()
-                        .filter_map(|r| r.account.as_deref().map(|a| (a, r.pending.is_some()))),
-                )
+                usage::count_sessions(reports.iter().filter_map(|r| {
+                    r.account
+                        .as_deref()
+                        .map(|a| (a, r.pending.as_deref().is_some_and(|p| p != a)))
+                }))
             } else {
                 Default::default()
             };
