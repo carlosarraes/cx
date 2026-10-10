@@ -6,7 +6,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 use crate::auth;
-use crate::state::{State, Store};
+use crate::state::{Account, State, Store};
 
 const MAX_OBSERVATION_AGE_SECONDS: i64 = 60 * 60;
 
@@ -45,13 +45,20 @@ struct UsageWindow {
     limit_window_seconds: Option<i64>,
 }
 
-pub fn fetch(store: &Store, alias: &str) -> Result<Observation> {
+/// Fresh credentials for `alias` plus the bearer token the ChatGPT backend expects.
+pub(crate) fn bearer(store: &Store, alias: &str) -> Result<(Account, String)> {
     let account = auth::credentials(store, alias, false)?;
     let access_token = account
         .data
         .pointer("/tokens/access_token")
         .and_then(serde_json::Value::as_str)
-        .context("stored credentials lack an access token")?;
+        .context("stored credentials lack an access token")?
+        .to_string();
+    Ok((account, access_token))
+}
+
+pub fn fetch(store: &Store, alias: &str) -> Result<Observation> {
+    let (account, access_token) = bearer(store, alias)?;
     let endpoint = std::env::var("CX_USAGE_URL")
         .unwrap_or_else(|_| "https://chatgpt.com/backend-api/wham/usage".into());
     let response = reqwest::blocking::Client::builder()
@@ -240,7 +247,7 @@ fn format_window(window: &Window, fallback: &str, now: i64) -> String {
     result
 }
 
-fn format_duration(seconds: i64) -> String {
+pub(crate) fn format_duration(seconds: i64) -> String {
     let seconds = seconds.max(0);
     let (days, hours, minutes) = (seconds / 86400, seconds % 86400 / 3600, seconds % 3600 / 60);
     match (days, hours, minutes) {

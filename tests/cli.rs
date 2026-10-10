@@ -290,3 +290,76 @@ fn legacy_usage_keeps_unknown_durations_and_activity_honest() {
     assert_eq!(success(command(&dir, &["usage"])),
         "- old      primary 100% (resets <1m) · [limited] · idle · as of 3m ago\n* unknown  ?? usage unknown (run `cx usage --live`) · running\n");
 }
+
+#[test]
+fn reset_spends_the_soonest_expiring_credit_after_confirmation() {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let dir = TempDir::new().unwrap();
+    auth(&dir, "carlos");
+    success(command(&dir, &["add", "carlos", "--current"]));
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        let mut requests = Vec::new();
+        for _ in 0..4 {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(&mut stream);
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).unwrap() > 0);
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap();
+                }
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            let path = request_line.split_whitespace().nth(1).unwrap().to_string();
+            let reply = match path.as_str() {
+                "/resets" => json!({"available_count": 2, "credits": [
+                    {"id": "late", "reset_type": "codex_rate_limits", "status": "available", "granted_at": "2026-10-01T00:00:00Z", "expires_at": "2026-11-12T09:30:00Z"},
+                    {"id": "soon", "reset_type": "codex_rate_limits", "status": "available", "granted_at": "2026-10-01T00:00:00Z", "expires_at": "2026-11-07T14:00:00Z"}
+                ]}),
+                "/resets/consume" => json!({"code": "reset", "windows_reset": 1}),
+                _ => json!({"rate_limit": {"allowed": true,
+                    "primary_window": {"used_percent": 0, "limit_window_seconds": 18000, "reset_at": null},
+                    "secondary_window": null}}),
+            }
+            .to_string();
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).unwrap();
+            requests.push((path, body));
+        }
+        requests
+    });
+    let run = |args: &[&str]| {
+        cli(&dir, args)
+            .env("CX_RESETS_URL", format!("{endpoint}/resets"))
+            .env("CX_USAGE_URL", format!("{endpoint}/usage"))
+            .env("TZ", "UTC")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap()
+    };
+    let refused = run(&["reset"]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("--yes"));
+    let output = success(run(&["reset", "--yes"]));
+    assert_eq!(
+        output,
+        "Reset 'carlos' with #1 expires 07 Nov 14:00 (1 window(s) reset).\n* carlos  5h 0% · running <1m\n"
+    );
+    let requests = server.join().unwrap();
+    let paths: Vec<_> = requests.iter().map(|(p, _)| p.as_str()).collect();
+    assert_eq!(paths, ["/resets", "/resets", "/resets/consume", "/usage"]);
+    let consume: Value = serde_json::from_slice(&requests[2].1).unwrap();
+    assert_eq!(consume["credit_id"], "soon");
+    assert_eq!(consume["redeem_request_id"].as_str().unwrap().len(), 36);
+}

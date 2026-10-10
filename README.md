@@ -63,6 +63,8 @@ like `cs add`. The browser must sign in to the intended account.
 | `cx whoami` | Show live login, selected account, and managed session identities |
 | `cx refresh` | Capture newer live credentials after an external login |
 | `cx usage [--live]` | Show cached usage, or fetch fresh observations |
+| `cx resets [alias]` | List available rate-limit reset credits, soonest expiry first |
+| `cx reset [alias] [--credit N] [-y]` | Spend a reset credit; defaults to the current account and the soonest-expiring credit |
 | `cx --help` / `cx --version` | Help and version |
 
 Usage follows the `cs` layout, with aligned aliases and reset countdowns:

@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use cx::{
-    auth, runtime,
+    auth, resets, runtime,
     state::{self, Paths, Store},
     usage,
 };
@@ -56,6 +56,18 @@ enum Commands {
     Usage {
         #[arg(long)]
         live: bool,
+    },
+    /// List rate-limit reset credits, soonest expiry first
+    Resets { alias: Option<String> },
+    /// Spend a reset credit (default: current account, soonest-expiring credit)
+    Reset {
+        alias: Option<String>,
+        /// Credit number from `cx resets`
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+        credit: Option<u32>,
+        /// Skip the confirmation prompt
+        #[arg(short, long)]
+        yes: bool,
     },
 }
 
@@ -252,8 +264,112 @@ fn execute(cli: Cli) -> Result<i32> {
                 println!("No saved accounts.");
             }
         }
+        Commands::Resets { alias } => {
+            let state = store.read()?;
+            let aliases: Vec<String> = match alias {
+                Some(alias) if !state.accounts.contains_key(&alias) => {
+                    bail!("unknown alias '{alias}'")
+                }
+                Some(alias) => vec![alias],
+                None => state.accounts.keys().cloned().collect(),
+            };
+            if aliases.is_empty() {
+                println!("No saved accounts.");
+            }
+            let width = aliases.iter().map(String::len).max().unwrap_or(0);
+            let mut failed = false;
+            for alias in &aliases {
+                match resets::list(&store, alias) {
+                    Ok(credits) => println!(
+                        "{}",
+                        resets::format_line(
+                            alias,
+                            width,
+                            state.current.as_ref() == Some(alias),
+                            &credits,
+                            chrono::Utc::now().timestamp(),
+                            usage::colors_enabled(),
+                        )
+                    ),
+                    Err(error) => {
+                        failed = true;
+                        eprintln!("{alias}: {error:#}");
+                    }
+                }
+            }
+            if failed {
+                return Ok(1);
+            }
+        }
+        Commands::Reset { alias, credit, yes } => {
+            let state = store.read()?;
+            let alias = match alias {
+                Some(alias) => alias,
+                None => state
+                    .current
+                    .clone()
+                    .context("no account selected; pass an alias")?,
+            };
+            if !state.accounts.contains_key(&alias) {
+                bail!("unknown alias '{alias}'");
+            }
+            let credits = resets::list(&store, &alias)?;
+            let index = credit.map_or(0, |n| n as usize - 1);
+            let Some(chosen) = credits.get(index) else {
+                bail!(
+                    "'{alias}' has {} reset credit(s) available; see `cx resets {alias}`",
+                    credits.len()
+                );
+            };
+            let label = resets::format_credit(index, chosen);
+            if !yes && !confirm(&format!("Use reset {label} on '{alias}'?"))? {
+                println!("Cancelled.");
+                return Ok(1);
+            }
+            let consumed = resets::consume(&store, &alias, &chosen.id)?;
+            match consumed.code {
+                resets::Outcome::Reset => {
+                    println!(
+                        "Reset '{alias}' with {label} ({} window(s) reset).",
+                        consumed.windows_reset
+                    );
+                    match usage::fetch(&store, &alias) {
+                        Ok(_) => {
+                            let state = store.read()?;
+                            let position = state.accounts.keys().position(|a| *a == alias);
+                            let lines = usage::format_lines(&state, chrono::Utc::now().timestamp());
+                            if let Some(line) = position.and_then(|p| lines.get(p)) {
+                                println!("{line}");
+                            }
+                        }
+                        Err(error) => eprintln!("{alias}: usage refresh failed: {error:#}"),
+                    }
+                }
+                resets::Outcome::NothingToReset => {
+                    bail!("'{alias}' has nothing to reset; the credit was not spent")
+                }
+                resets::Outcome::NoCredit => {
+                    bail!("credit is no longer available on '{alias}'; see `cx resets {alias}`")
+                }
+                resets::Outcome::AlreadyRedeemed => {
+                    bail!("credit was already redeemed; see `cx resets {alias}`")
+                }
+            }
+        }
     }
     Ok(0)
+}
+
+fn confirm(question: &str) -> Result<bool> {
+    use std::io::{IsTerminal, Write};
+    if !std::io::stdin().is_terminal() {
+        bail!("refusing to spend a reset credit without confirmation; pass --yes");
+    }
+    eprint!("{question} [y/N] ");
+    std::io::stderr().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    Ok(matches!(answer.trim(), "y" | "Y" | "yes"))
 }
 
 fn report_switch(paths: &Paths) -> Result<()> {
