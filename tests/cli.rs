@@ -86,13 +86,13 @@ fn invalid_alias_and_missing_account_fail_without_printing_credentials() {
 }
 
 #[test]
-fn help_exposes_cs_commands_and_has_no_run_subcommand() {
+fn help_exposes_cs_commands_and_managed_run() {
     let dir = TempDir::new().unwrap();
     let help = success(command(&dir, &["--help"]));
     for name in ["add", "switch", "list", "del", "whoami", "refresh", "usage"] {
         assert!(help.contains(name), "{help}");
     }
-    assert!(!help
+    assert!(help
         .lines()
         .any(|line| line.trim_start().starts_with("run ")));
 }
@@ -201,7 +201,7 @@ fn usage_matches_cs_layout_and_labels_a_weekly_primary_window() {
     });
     fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
     assert_eq!(success(command(&dir, &["usage"])),
-        "- carlos   7d 83% (resets 5d18h) · idle 1h18m\n* carraes  5h 10% (resets 2h53m) · 7d 94% (resets 1d3h) · running 13m\n");
+        "carlos  (0)  7d 83% (resets 5d18h) · idle 1h18m\ncarraes (0)  5h 10% (resets 2h53m) · 7d 94% (resets 1d3h) · running 13m\n");
 }
 
 #[test]
@@ -266,7 +266,7 @@ fn live_usage_preserves_the_server_window_duration() {
             .unwrap(),
     );
     server.join().unwrap();
-    assert_eq!(output, "* carlos  7d 83% (resets 5d18h) · running <1m\n");
+    assert_eq!(output, "carlos (0)  7d 83% (resets 5d18h) · running <1m\n");
     assert_eq!(success(command(&dir, &["usage"])), output);
 }
 
@@ -288,7 +288,7 @@ fn legacy_usage_keeps_unknown_durations_and_activity_honest() {
     });
     fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
     assert_eq!(success(command(&dir, &["usage"])),
-        "- old      primary 100% (resets <1m) · [limited] · idle · as of 3m ago\n* unknown  ?? usage unknown (run `cx usage --live`) · running\n");
+        "old     (0)  primary 100% (resets <1m) · [limited] · idle · as of 3m ago\nunknown (0)  ?? usage unknown (run `cx usage --live`) · running\n");
 }
 
 #[test]
@@ -354,7 +354,7 @@ fn reset_spends_the_soonest_expiring_credit_after_confirmation() {
     let output = success(run(&["reset", "--yes"]));
     assert_eq!(
         output,
-        "Reset 'carlos' with #1 expires 07 Nov 14:00 (1 window(s) reset).\n* carlos  5h 0% · running <1m\n"
+        "Reset 'carlos' with #1 expires 07 Nov 14:00 (1 window(s) reset).\ncarlos (0)  5h 0% · running <1m\n"
     );
     let requests = server.join().unwrap();
     let paths: Vec<_> = requests.iter().map(|(p, _)| p.as_str()).collect();

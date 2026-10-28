@@ -178,13 +178,6 @@ pub fn format_lines_colored(
                 .usage
                 .as_ref()
                 .is_some_and(|u| u.primary.is_some() || u.secondary.is_some());
-            let marker = if current {
-                '*'
-            } else if known {
-                '-'
-            } else {
-                '~'
-            };
             let mut parts = Vec::new();
             if let Some(usage) = &account.usage {
                 for (fallback, window) in
@@ -210,13 +203,10 @@ pub fn format_lines_colored(
             } else {
                 ("idle", state.last_active_at.get(alias).copied())
             };
-            let mut activity = match since {
+            let activity = match since {
                 Some(since) => format!("{activity} {}", format_duration(now.saturating_sub(since))),
                 None => activity.into(),
             };
-            if let Some(c) = sessions.get(alias).filter(|c| c.active > 0) {
-                activity = format!("{activity} {}", format_sessions(*c));
-            }
             parts.push(activity);
             if let Some(usage) = &account.usage {
                 let age = now.saturating_sub(usage.observed_at);
@@ -224,7 +214,11 @@ pub fn format_lines_colored(
                     parts.push(format!("as of {} ago", format_duration(age)));
                 }
             }
-            format!("{marker} {alias:<width$}  {}", parts.join(" · "))
+            format!(
+                "{alias:<width$} {}  {}",
+                format_sessions(sessions.get(alias).copied().unwrap_or_default()),
+                parts.join(" · ")
+            )
         })
         .collect()
 }
@@ -306,10 +300,10 @@ mod tests {
             ("c", false),
         ]);
         let lines = format_lines_colored(&obs, 0, &sessions, false);
-        assert!(lines[0].ends_with("idle (2 →)"), "{}", lines[0]);
-        assert!(lines[1].ends_with("idle (3, 1 →)"), "{}", lines[1]);
-        assert!(lines[2].ends_with("idle (1)"), "{}", lines[2]);
-        assert!(lines[3].ends_with("idle"), "{}", lines[3]);
+        assert!(lines[0].starts_with("a (2 →)"), "{}", lines[0]);
+        assert!(lines[1].starts_with("b (3, 1 →)"), "{}", lines[1]);
+        assert!(lines[2].starts_with("c (1)"), "{}", lines[2]);
+        assert!(lines[3].starts_with("d (0)"), "{}", lines[3]);
     }
 
     #[test]

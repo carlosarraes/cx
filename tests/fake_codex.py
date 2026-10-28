@@ -68,6 +68,13 @@ if "app-server" in sys.argv:
                 else:
                     send({"id": msg["id"], "result": {"type": "chatgptAuthTokens"}})
                     send({"method": "account/updated", "params": {"authMode": "chatgpt", "planType": "plus"}})
+            elif method == "turn/interrupt":
+                log({"interrupted_turn": msg["params"]["turnId"]})
+                send({"id": msg["id"], "result": {}})
+                send({"method":"turn/completed","params":{"threadId":"thread-a","turn":{"id":"turn-1","status":"interrupted"}}})
+            elif method == "thread/resume":
+                log({"resume_account": account})
+                send({"id": msg["id"], "result": {"thread": {"id": msg["params"]["threadId"]}}})
             elif method == "thread/list":
                 send({"id": msg["id"], "result": {"data": [], "nextCursor": None}})
             elif method == "config/read":
@@ -96,6 +103,7 @@ if "app-server" in sys.argv:
             held_login = None
         if pending and (root / "release").exists() and not began:
             began = True
+            (root / "turn_started").touch()
             send({"method": "turn/started", "params": {"threadId": "thread-a", "turn": {"id": "turn-1", "items": [], "status": "inProgress", "error": None}}})
             send({"id": pending["id"], "result": {"turn": {"id": "turn-1", "status": "inProgress"}, "reviewThreadId": "thread-a"}})
         if began and (root / "complete").exists() and not completed:
@@ -158,6 +166,10 @@ while True:
         assert msg["result"]["data"] == []
         break
 (root / "ready").touch()
+if scenario.startswith("resume-"):
+    send({"id": 99, "method": "thread/resume", "params": {"threadId": "resumed-root"}})
+    while receive().get("id") != 99:
+        pass
 if scenario == "model-isolation":
     send({"id": 29, "method": "thread/settings/update", "params": {"threadId": "thread-a", "model": "gpt-5.6-luna", "effort": "high"}})
     while receive().get("id") != 29:

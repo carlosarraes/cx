@@ -1,9 +1,9 @@
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 #[derive(Default)]
 pub struct Turns {
-    active: HashSet<String>,
+    active: HashMap<String, Option<String>>,
     starting: HashMap<String, (String, bool)>,
 }
 
@@ -20,7 +20,13 @@ impl Turns {
                     .pointer("/result/reviewThreadId")
                     .and_then(Value::as_str)
                     .unwrap_or(&thread);
-                self.active.insert(thread.to_owned());
+                self.active.insert(
+                    thread.to_owned(),
+                    response
+                        .pointer("/result/turn/id")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                );
             }
         }
     }
@@ -30,7 +36,13 @@ impl Turns {
         };
         match message["method"].as_str() {
             Some("turn/started") => {
-                self.active.insert(thread.to_owned());
+                self.active.insert(
+                    thread.to_owned(),
+                    message
+                        .pointer("/params/turn/id")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                );
                 for (starting_thread, observed) in self.starting.values_mut() {
                     if starting_thread == thread {
                         *observed = true;
@@ -42,6 +54,15 @@ impl Turns {
             }
             _ => {}
         }
+    }
+    pub fn interrupts(&self) -> Option<Vec<(String, String)>> {
+        if !self.starting.is_empty() {
+            return None;
+        }
+        self.active
+            .iter()
+            .map(|(thread, turn)| Some((thread.clone(), turn.clone()?)))
+            .collect()
     }
     pub fn busy(&self) -> bool {
         !self.active.is_empty() || !self.starting.is_empty()

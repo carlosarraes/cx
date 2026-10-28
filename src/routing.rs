@@ -278,6 +278,7 @@ pub fn reserve(
     resume: Option<&str>,
     mode: Mode,
 ) -> Result<Reservation> {
+    import_legacy(paths)?;
     let (s, cfg, forced) = prepare(paths, options.account.as_deref())?;
     reserve_prepared(
         Registry::new(paths),
@@ -289,4 +290,129 @@ pub fn reserve(
         mode,
         chrono::Utc::now().timestamp(),
     )
+}
+
+pub fn import_legacy(paths: &Paths) -> Result<()> {
+    let reports = crate::runtime::sessions(paths)?;
+    let state = Store::new(paths.clone()).read()?;
+    Registry::new(paths).update(|s| {
+        for report in reports {
+            if s.runs
+                .values()
+                .any(|r| r.process.pid == report.pid && !r.id.starts_with("legacy:"))
+            {
+                continue;
+            }
+            let Some(alias) = report.account else {
+                continue;
+            };
+            let Some(account) = state.accounts.get(&alias) else {
+                continue;
+            };
+            if report.email.as_deref() != Some(&account.email)
+                || report.account_id.as_deref() != Some(&account.account_id)
+            {
+                continue;
+            }
+            let Some(process) = Process::read(report.pid) else {
+                continue;
+            };
+            let id = format!("legacy:{}", report.pid);
+            s.runs.insert(
+                id.clone(),
+                ManagedSession {
+                    id,
+                    process,
+                    account: Identity::new(&alias, account),
+                    mode: Mode::Interactive,
+                    pinned: false,
+                    label: None,
+                    started_at: 0,
+                    threads: vec![],
+                    pending: None,
+                    error: Some(
+                        "older launcher; reopen with updated cx for targeted switching".into(),
+                    ),
+                },
+            );
+        }
+        Ok(())
+    })
+}
+
+pub fn destination(paths: &Paths, name: &str) -> Result<Identity> {
+    let (state, cfg, forced) = prepare(paths, Some(name))?;
+    let alias = forced.context("missing explicit destination")?;
+    let a = &state.accounts[&alias];
+    if !a
+        .usage
+        .as_ref()
+        .is_some_and(|u| eligible(u, chrono::Utc::now().timestamp(), &cfg))
+    {
+        return Err(failure(
+            20,
+            format!("{alias}: quota exhausted; no fallback"),
+        ));
+    }
+    Ok(Identity::new(&alias, a))
+}
+
+pub fn preferred_resume(paths: &Paths, id: &str, root: &str) -> Result<Identity> {
+    let registry = Registry::new(paths);
+    let run = registry.update(|s| s.runs.get(id).cloned().context("missing reservation"))?;
+    let (state, cfg, _) = prepare(paths, run.pinned.then_some(run.account.alias.as_str()))?;
+    let now = chrono::Utc::now().timestamp();
+    registry.update(|s| {
+        let run = s.runs.get(id).context("missing reservation")?;
+        if s.runs
+            .iter()
+            .any(|(other, r)| other != id && r.threads.iter().any(|t| t == root))
+        {
+            return Err(failure(70, "conversation already running"));
+        }
+        let mut counts = BTreeMap::new();
+        for (other, r) in &s.runs {
+            if other != id {
+                *counts.entry(r.account.alias.clone()).or_insert(0) += 1;
+            }
+        }
+        let recent = s
+            .bindings
+            .get(root)
+            .filter(|b| {
+                b.last_prompt > 0
+                    && now >= b.last_prompt
+                    && now - b.last_prompt < cfg.affinity_seconds
+            })
+            .and_then(|b| {
+                state
+                    .accounts
+                    .get(&b.account.alias)
+                    .filter(|a| b.account.matches(a))
+                    .map(|_| b.account.clone())
+            });
+        let current = state
+            .accounts
+            .get(&run.account.alias)
+            .filter(|a| run.account.matches(a))
+            .map(|_| run.account.clone());
+        let target = if run.pinned {
+            current.filter(|a| {
+                state.accounts[&a.alias]
+                    .usage
+                    .as_ref()
+                    .is_some_and(|u| eligible(u, now, &cfg))
+            })
+        } else {
+            recent.or(current).or_else(|| {
+                select(&state, &counts, now, &cfg).map(|a| Identity::new(&a, &state.accounts[&a]))
+            })
+        }
+        .ok_or_else(|| failure(20, "no account has eligible quota for resume"))?;
+        let run = s.runs.get_mut(id).context("missing reservation")?;
+        if !run.threads.iter().any(|t| t == root) {
+            run.threads.push(root.into());
+        }
+        Ok(target)
+    })
 }

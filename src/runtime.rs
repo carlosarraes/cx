@@ -2,6 +2,8 @@
 use crate::{
     auth,
     protocol::{starts_turn, Requests, Turns},
+    routing::{self, RunOptions},
+    sessions::{Identity, Mode, Reservation},
     state::{Account, Paths, Store},
 };
 use anyhow::{bail, Context, Result};
@@ -35,6 +37,10 @@ type Socket = WebSocketStream<UnixStream>;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionStatus {
+    #[serde(default)]
+    pub pinned: bool,
+    #[serde(default)]
+    pub control_version: u8,
     pub pid: u32,
     pub account: Option<String>,
     pub email: Option<String>,
@@ -45,7 +51,118 @@ pub struct SessionStatus {
 
 struct Control {
     action: String,
+    targeted: Option<TargetRequest>,
     reply: oneshot::Sender<SessionStatus>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct TargetRequest {
+    run_id: String,
+    source: Identity,
+    target: Identity,
+    thread: Option<String>,
+    interrupt: bool,
+    validate_only: bool,
+}
+
+pub fn switch_targeted(
+    paths: &Paths,
+    destination: &str,
+    thread: Option<&str>,
+    from: Option<&str>,
+    interrupt: bool,
+) -> Result<Vec<SessionStatus>> {
+    routing::import_legacy(paths)?;
+    let target = routing::destination(paths, destination)?;
+    let source = from
+        .map(|v| routing::resolve(&Store::new(paths.clone()).read()?, v))
+        .transpose()?;
+    let runs: Vec<_> = crate::sessions::Registry::new(paths)
+        .list()?
+        .into_iter()
+        .filter(|r| {
+            thread.is_some_and(|t| r.id == t || r.threads.iter().any(|v| v == t))
+                || source.as_ref().is_some_and(|s| &r.account.alias == s)
+        })
+        .collect();
+    if runs.is_empty() {
+        bail!("no matching live managed session; use cx sessions");
+    }
+    for r in &runs {
+        if r.mode == Mode::Headless {
+            bail!("{}: live headless switching is unsupported", r.id);
+        }
+        if r.id.starts_with("legacy:") {
+            bail!("{}: older launcher; reopen with updated cx run", r.id);
+        }
+        if thread.is_some() && r.threads.len() > 1 {
+            bail!(
+                "{}: runtime owns multiple conversations; use --from to select the whole runtime",
+                r.id
+            );
+        }
+    }
+    let rt = executor()?;
+    let mut requests = Vec::new();
+    for run in runs {
+        let req = TargetRequest {
+            run_id: run.id.clone(),
+            source: run.account,
+            target: target.clone(),
+            thread: thread.filter(|t| *t != run.id).map(str::to_string),
+            interrupt,
+            validate_only: true,
+        };
+        let response = rt.block_on(target_request(paths, run.process.pid, &req))?;
+        if response.control_version < 1 {
+            bail!(
+                "{}: launcher does not support targeted switching; reopen with updated cx run",
+                run.id
+            );
+        }
+        if let Some(error) = response.error {
+            bail!("{}: {error}", run.id);
+        }
+        requests.push((run.process.pid, req));
+    }
+    let mut reports = Vec::new();
+    for (pid, mut req) in requests {
+        req.validate_only = false;
+        match rt.block_on(target_request(paths, pid, &req)) {
+            Ok(report) => reports.push(report),
+            Err(_) => reports.push(SessionStatus {
+                pid,
+                pinned: false,
+                control_version: 1,
+                account: Some(req.source.alias),
+                email: None,
+                account_id: None,
+                pending: None,
+                error: Some(
+                    "targeted request was not acknowledged; inspect cx sessions before retrying"
+                        .into(),
+                ),
+            }),
+        }
+    }
+    Ok(reports)
+}
+
+async fn target_request(paths: &Paths, pid: u32, request: &TargetRequest) -> Result<SessionStatus> {
+    timeout(DEADLINE + Duration::from_secs(5), async {
+        let mut socket =
+            UnixStream::connect(paths.data.join("runtimes").join(format!("{pid}.sock"))).await?;
+        socket
+            .write_all(format!("{}\n", serde_json::to_string(request)?).as_bytes())
+            .await?;
+        let mut line = String::new();
+        BufReader::new(socket.take(8192))
+            .read_line(&mut line)
+            .await?;
+        Ok(serde_json::from_str(&line)?)
+    })
+    .await
+    .context("targeted switch timed out")?
 }
 
 fn executor() -> Result<tokio::runtime::Runtime> {
@@ -55,7 +172,20 @@ fn executor() -> Result<tokio::runtime::Runtime> {
 }
 
 pub fn run(paths: Paths, codex: OsString, args: Vec<OsString>) -> Result<i32> {
-    executor()?.block_on(run_async(paths, codex, args))
+    run_managed(paths, codex, args, RunOptions::default())
+}
+
+pub fn run_managed(
+    paths: Paths,
+    codex: OsString,
+    args: Vec<OsString>,
+    options: RunOptions,
+) -> Result<i32> {
+    if options.usage_file.is_some() {
+        anyhow::bail!("--usage-file requires a headless exec run");
+    }
+    let reservation = routing::reserve(&paths, &options, None, Mode::Interactive)?;
+    executor()?.block_on(run_async(paths, codex, args, reservation))
 }
 
 pub fn sessions(paths: &Paths) -> Result<Vec<SessionStatus>> {
@@ -84,31 +214,40 @@ async fn contact(paths: &Paths, action: &str) -> Result<Vec<SessionStatus>> {
             .and_then(|s| s.to_str())
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
-        let result = timeout(DEADLINE + Duration::from_secs(5), async {
-            let mut socket = match UnixStream::connect(&path).await {
-                Ok(s) => s,
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
-                    ) =>
-                {
-                    return Ok(None)
-                }
-                Err(e) => return Err(e.into()),
-            };
-            socket.write_all(format!("{action}\n").as_bytes()).await?;
-            let mut line = String::new();
-            BufReader::new(socket.take(8192))
-                .read_line(&mut line)
-                .await?;
-            Ok::<_, anyhow::Error>(Some(serde_json::from_str::<SessionStatus>(&line)?))
-        })
+        let result = timeout(
+            if action == "status" {
+                Duration::from_secs(1)
+            } else {
+                DEADLINE + Duration::from_secs(5)
+            },
+            async {
+                let mut socket = match UnixStream::connect(&path).await {
+                    Ok(s) => s,
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                        ) =>
+                    {
+                        return Ok(None)
+                    }
+                    Err(e) => return Err(e.into()),
+                };
+                socket.write_all(format!("{action}\n").as_bytes()).await?;
+                let mut line = String::new();
+                BufReader::new(socket.take(8192))
+                    .read_line(&mut line)
+                    .await?;
+                Ok::<_, anyhow::Error>(Some(serde_json::from_str::<SessionStatus>(&line)?))
+            },
+        )
         .await;
         match result {
             Ok(Ok(Some(report))) => reports.push(report),
             Ok(Ok(None)) => { /* A dead socket is ignored; its owner may still be cleaning up. */ }
             _ => reports.push(SessionStatus {
+                pinned: false,
+                control_version: 0,
                 pid,
                 account: None,
                 email: None,
@@ -128,13 +267,17 @@ async fn controls(listener: UnixListener, tx: mpsc::Sender<Control>) {
             let _ = timeout(DEADLINE + Duration::from_secs(5), async move {
                 let (read, mut write) = socket.into_split();
                 let mut action = String::new();
-                BufReader::new(read.take(32)).read_line(&mut action).await?;
-                if !matches!(action.trim(), "status" | "switch") {
+                BufReader::new(read.take(8192))
+                    .read_line(&mut action)
+                    .await?;
+                let targeted = serde_json::from_str::<TargetRequest>(action.trim()).ok();
+                if targeted.is_none() && !matches!(action.trim(), "status" | "switch") {
                     return Ok::<_, anyhow::Error>(());
                 }
                 let (reply, result) = oneshot::channel();
                 tx.send(Control {
                     action: action.trim().into(),
+                    targeted,
                     reply,
                 })
                 .await?;
@@ -197,13 +340,24 @@ fn report_app_server_error(log: &mut fs::File) {
     }
 }
 
-async fn run_async(paths: Paths, codex: OsString, args: Vec<OsString>) -> Result<i32> {
+async fn run_async(
+    paths: Paths,
+    codex: OsString,
+    args: Vec<OsString>,
+    reservation: Reservation,
+) -> Result<i32> {
     let mut signals = Signals::new()?;
     let store = Store::new(paths.clone());
-    let initial = store.read()?.current.context(
-        "No account selected. Run `cx add <alias> --current` or `cx add <alias>` first.",
-    )?;
-    let account = credentials(&store, &initial, false).await?;
+    let selected = reservation.get()?;
+    let initial = selected.account.alias.clone();
+    let saved = selected.account.clone();
+    let account = {
+        let store = store.clone();
+        tokio::task::spawn_blocking(move || {
+            auth::credentials_for(&store, &saved.alias, &saved.email, &saved.account_id, false)
+        })
+        .await??
+    };
     // The directory's permissions protect both WebSocket and control connections.
     let transport = tempfile::Builder::new().prefix("cx-").tempdir()?;
     fs::set_permissions(transport.path(), fs::Permissions::from_mode(0o700))?;
@@ -265,6 +419,7 @@ async fn run_async(paths: Paths, codex: OsString, args: Vec<OsString>) -> Result
                     store,
                     alias: initial,
                     account,
+                    reservation,
                 },
                 &mut signals,
             ).await;
@@ -314,11 +469,14 @@ async fn relay(
         store,
         alias: initial,
         account: initial_account,
+        reservation,
     } = launch;
     let mut writer = server.stdin.take().context("missing app-server stdin")?;
     let mut lines =
         BufReader::new(server.stdout.take().context("missing app-server stdout")?).lines();
     let mut status = SessionStatus {
+        pinned: reservation.get()?.pinned,
+        control_version: 1,
         pid: std::process::id(),
         account: None,
         email: None,
@@ -326,6 +484,7 @@ async fn relay(
         pending: Some(initial.clone()),
         error: None,
     };
+    let mut announced = false;
     let mut requests = Requests::default();
     let mut turns = Turns::default();
     let mut pane_model = PaneModel::default();
@@ -353,7 +512,37 @@ async fn relay(
                 }
             },
             Some(control) = controls.recv() => {
-                if control.action == "switch" {
+                if let Some(request) = control.targeted {
+                    let run = reservation.get()?;
+                    let error = if request.run_id != run.id || request.source != run.account {
+                        Some("session identity changed; inspect cx sessions and retry")
+                    } else if request.thread.as_ref().is_some_and(|t| !run.threads.contains(t) || run.threads.len() != 1) {
+                        Some("conversation ownership changed; inspect cx sessions and retry")
+                    } else if status.pending.is_some() || login.is_some() {
+                        Some("account change already pending; retry after it finishes")
+                    } else if request.interrupt && turns.interrupts().is_none() {
+                        Some("turn is starting and has no interrupt ID yet; retry shortly")
+                    } else { None };
+                    if let Some(error) = error {
+                        let mut response=status.clone();response.error=Some(error.into());let _=control.reply.send(response);
+                    } else if request.validate_only {
+                        let mut response=status.clone();response.error=None;let _=control.reply.send(response);
+                    } else {
+                        desired_revision+=1;
+                        status.pending=Some(request.target.alias.clone());status.error=None;
+                        reservation.status(Some(request.target),None)?;
+                        if request.interrupt {
+                            for (thread,turn) in turns.interrupts().unwrap_or_default() {
+                                serial+=1;
+                                send(&mut writer,&json!({"id":format!("cx.interrupt.{serial}"),"method":"turn/interrupt","params":{"threadId":thread,"turnId":turn}})).await?;
+                            }
+                        }
+                        if turns.busy() || !initialized { let _=control.reply.send(status.clone()); }
+                        else { waiting.push(control.reply); }
+                    }
+                } else if control.action == "switch" && reservation.get()?.pinned {
+                    let _ = control.reply.send(status.clone());
+                } else if control.action == "switch" {
                     match store.read().and_then(|s| s.current.context("no selected account")) {
                         Ok(alias) => {
                             desired_revision += 1;
@@ -370,8 +559,21 @@ async fn relay(
                 match frame {
                     Some(Ok(Message::Text(text))) => {
                         let message: Value = serde_json::from_str(&text).context("invalid Codex TUI protocol message")?;
-                        if login.is_some() { deferred.push_back(message); }
-                        else { forward_client(message, &mut writer, &mut socket, ClientState { requests: &mut requests, turns: &mut turns, pane_model: &mut pane_model, initialized, codex_home: &store.paths.codex_home }).await?; }
+                        let resume_root = (message["method"] == "thread/resume" && reservation.get()?.threads.is_empty())
+                            .then(||message.pointer("/params/threadId").and_then(Value::as_str)).flatten().map(str::to_string);
+                        if let Some(root) = resume_root.filter(|_| initialized && login.is_none()) {
+                            let paths=store.paths.clone();let run_id=reservation.id.clone();
+                            let selected=tokio::task::spawn_blocking(move || routing::preferred_resume(&paths,&run_id,&root)).await?;
+                            match selected {
+                                Ok(target) if status.account.as_ref()!=Some(&target.alias) => {
+                                    desired_revision+=1;status.pending=Some(target.alias.clone());reservation.status(Some(target),None)?;
+                                    deferred.push_back(message);
+                                }
+                                Ok(_) => forward_client(message, &mut writer, &mut socket, ClientState { requests: &mut requests, turns: &mut turns, pane_model: &mut pane_model, initialized, codex_home: &store.paths.codex_home, reservation: &reservation }).await?,
+                                Err(error) => outgoing(&mut socket,json!({"id":message["id"],"error":{"code":-32000,"message":error.to_string()}})).await?,
+                            }
+                        } else if login.is_some() || (status.pending.is_some() && starts_turn(message["method"].as_str().unwrap_or(""))) { deferred.push_back(message); }
+                        else { forward_client(message, &mut writer, &mut socket, ClientState { requests: &mut requests, turns: &mut turns, pane_model: &mut pane_model, initialized, codex_home: &store.paths.codex_home, reservation: &reservation }).await?; }
                     }
                     Some(Ok(Message::Ping(bytes))) => { socket.send(Message::Pong(bytes)).await?; },
                     Some(Ok(Message::Close(_))) | None => return Ok(timeout(Duration::from_secs(2), tui.wait()).await.ok().and_then(|r| r.ok()).and_then(|s|s.code()).unwrap_or(0)),
@@ -412,6 +614,7 @@ async fn relay(
                     status.account=Some(completed.alias.clone());
                     status.email=Some(completed.account.email.clone());
                     status.account_id=Some(completed.account.account_id.clone());
+                    reservation.set_account(Identity::new(&completed.alias, &completed.account))?;
                     loaded=Some(completed.account);
                     if status.pending.as_ref()==Some(&completed.alias) && completed.revision == desired_revision { status.pending=None; }
                     status.error=None;
@@ -425,6 +628,12 @@ async fn relay(
                     }
                 } else if let Some((id, method)) = requests.restore(&mut message) {
                     pane_model.response(&id, &method, &mut message);
+                    if matches!(method.as_str(), "thread/start" | "thread/resume" | "thread/fork") && message.get("error").is_none() {
+                        if let Some(thread) = message.pointer("/result/thread/id").and_then(Value::as_str) {
+                            reservation.attach(thread, false)?;
+                            if !announced { eprintln!("cx: {thread} -> {}", reservation.get()?.account.alias); announced = true; }
+                        }
+                    }
                     if starts_turn(&method) { turns.start_response(&id, &message); }
                     if method=="initialize" {
                         if message.get("error").is_some() { bail!("Codex refused initialization; update Codex or cx"); }
@@ -444,7 +653,23 @@ async fn relay(
         }
         if initialized && login.is_none() && !turns.busy() {
             if let Some(alias) = status.pending.clone() {
-                match credentials(&store, &alias, false).await {
+                let expected = reservation.get()?.pending;
+                let account = if let Some(expected) = expected {
+                    let store = store.clone();
+                    tokio::task::spawn_blocking(move || {
+                        auth::credentials_for(
+                            &store,
+                            &expected.alias,
+                            &expected.email,
+                            &expected.account_id,
+                            false,
+                        )
+                    })
+                    .await?
+                } else {
+                    credentials(&store, &alias, false).await
+                };
+                match account {
                     Ok(account) => {
                         let unchanged = loaded.as_ref().is_some_and(|old| {
                             old.email == account.email
@@ -454,6 +679,7 @@ async fn relay(
                         });
                         if unchanged && status.account.as_ref() == Some(&alias) {
                             status.pending = None;
+                            reservation.status(None, None)?;
                             for reply in waiting.drain(..) {
                                 let _ = reply.send(status.clone());
                             }
@@ -479,6 +705,7 @@ async fn relay(
                         status.error =
                             Some(format!("could not load account {alias}; sign in again"));
                         status.pending = None;
+                        reservation.status(None, status.error.clone())?;
                         for reply in waiting.drain(..) {
                             let _ = reply.send(status.clone());
                         }
@@ -486,7 +713,7 @@ async fn relay(
                 }
             }
         }
-        if initialized && login.is_none() {
+        if initialized && login.is_none() && status.pending.is_none() {
             while let Some(message) = deferred.pop_front() {
                 forward_client(
                     message,
@@ -498,6 +725,7 @@ async fn relay(
                         pane_model: &mut pane_model,
                         initialized,
                         codex_home: &store.paths.codex_home,
+                        reservation: &reservation,
                     },
                 )
                 .await?;
@@ -518,6 +746,7 @@ async fn forward_client(
         pane_model,
         initialized,
         codex_home,
+        reservation,
     } = state;
     let method = message["method"].as_str().unwrap_or("").to_owned();
     if method == "initialized" && initialized {
@@ -557,6 +786,7 @@ async fn forward_client(
                 .pointer("/params/threadId")
                 .and_then(Value::as_str)
                 .context("turn-creating request lacks threadId")?;
+            reservation.attach(thread, method == "turn/start")?;
             turns.starting(&id, thread);
         }
     }
@@ -569,6 +799,7 @@ struct ClientState<'a> {
     pane_model: &'a mut PaneModel,
     initialized: bool,
     codex_home: &'a Path,
+    reservation: &'a Reservation,
 }
 
 #[derive(Default)]
@@ -676,9 +907,14 @@ async fn acknowledge_local_model_selection(
 
 pub fn print_status(report: &SessionStatus) {
     let active = format!(
-        "{} ({})",
+        "{} ({}){}",
         report.account.as_deref().unwrap_or("unknown"),
-        report.email.as_deref().unwrap_or("identity unknown")
+        report.email.as_deref().unwrap_or("identity unknown"),
+        if report.pinned {
+            " [pinned; global switch skipped]"
+        } else {
+            ""
+        }
     );
     if let Some(error) = &report.error {
         println!("session {}: {active} ({error})", report.pid);
@@ -700,6 +936,7 @@ struct Launch {
     store: Store,
     alias: String,
     account: Account,
+    reservation: Reservation,
 }
 struct Signals {
     terminate: tokio::signal::unix::Signal,

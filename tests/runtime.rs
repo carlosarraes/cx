@@ -16,6 +16,9 @@ struct Fixture {
 }
 impl Fixture {
     fn new(scenario: &str) -> Self {
+        Self::with_args(scenario, &[])
+    }
+    fn with_args(scenario: &str, args: &[&str]) -> Self {
         let dir = TempDir::new().unwrap();
         let script = dir.path().join("codex");
         fs::write(&script, include_str!("fake_codex.py")).unwrap();
@@ -34,8 +37,29 @@ impl Fixture {
             fixture.ok(&["add", account, "--current"]);
         }
         fixture.ok(&["switch", "personal", "--yes"]);
+        let state_path = fixture.dir.path().join("data/cx/state.json");
+        let mut state: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        for (alias, account) in state["accounts"].as_object_mut().unwrap() {
+            account["usage"] = json!({"primary":{"used_percent":if scenario=="quota-start" && alias=="personal" {100}else{0},"resets_at":chrono::Utc::now().timestamp()+18000,"limit_window_seconds":18000},"secondary":{"used_percent":0,"resets_at":chrono::Utc::now().timestamp()+604800,"limit_window_seconds":604800},"allowed":true,"observed_at":chrono::Utc::now().timestamp()});
+        }
+        fs::write(state_path, state.to_string()).unwrap();
+        if scenario.starts_with("resume-") {
+            let usage = &mut state["accounts"]["work"]["usage"]["secondary"]["used_percent"];
+            if scenario == "resume-exhausted" {
+                *usage = json!(100);
+            }
+            fs::write(
+                fixture.dir.path().join("data/cx/state.json"),
+                state.to_string(),
+            )
+            .unwrap();
+            let last =
+                chrono::Utc::now().timestamp() - if scenario == "resume-old" { 7200 } else { 60 };
+            fs::write(fixture.dir.path().join("data/cx/sessions.json"), json!({"runs":{},"bindings":{"resumed-root":{"account":{"alias":"work","email":"work@example.test","account_id":"work"},"last_prompt":last}}}).to_string()).unwrap();
+        }
         let child = fixture
             .command()
+            .args(args)
             .env("CX_TEST_SCENARIO", scenario)
             .stdin(Stdio::null())
             .stdout(Stdio::from(
@@ -400,5 +424,91 @@ fn installed_codex_applies_account_changes_without_restarting() {
             .count(),
         1
     );
+    assert!(f.finish().success());
+}
+
+#[test]
+fn automatic_start_skips_exhausted_selected_account() {
+    let mut f = Fixture::new("quota-start");
+    f.wait(|f| f.dir.path().join("ready").exists());
+    assert!(f.events().iter().any(|e| e["login"] == "work"));
+    let shared: Value =
+        serde_json::from_slice(&fs::read(f.dir.path().join("home/auth.json")).unwrap()).unwrap();
+    assert_eq!(shared["tokens"]["account_id"], "personal");
+    let registry: Value =
+        serde_json::from_slice(&fs::read(f.dir.path().join("data/cx/sessions.json")).unwrap())
+            .unwrap();
+    assert_eq!(registry["runs"].as_object().unwrap().len(), 1);
+}
+#[test]
+fn explicit_pin_ignores_global_broadcast() {
+    let mut f = Fixture::with_args("idle", &["run", "--account", "personal", "--"]);
+    f.wait(|f| f.dir.path().join("ready").exists());
+    f.ok(&["switch", "work", "--yes"]);
+    assert!(!f.events().iter().any(|e| e["login"] == "work"));
+}
+
+#[test]
+fn resume_affinity_is_recent_eligible_and_optional() {
+    for (scenario, args, expected) in [
+        ("resume-recent", vec![], "work"),
+        ("resume-old", vec![], "personal"),
+        ("resume-exhausted", vec![], "personal"),
+        (
+            "resume-pinned",
+            vec!["run", "--account", "personal"],
+            "personal",
+        ),
+    ] {
+        let mut f = Fixture::with_args(scenario, &args);
+        f.wait(|f| f.events().iter().any(|e| e.get("resume_account").is_some()));
+        assert!(
+            f.events().iter().any(|e| e["resume_account"] == expected),
+            "{scenario}: {:?}",
+            f.events()
+        );
+        assert!(f.finish().success());
+    }
+}
+
+#[test]
+fn targeted_switch_preserves_shared_login_and_defers_busy_turn() {
+    let mut f = Fixture::new("turn/start");
+    f.wait(|f| f.dir.path().join("busy").exists());
+    let output = f.ok(&["switch", "work", "--session", "thread-a"]);
+    assert!(output.contains("pending"), "{output}");
+    assert!(!f.events().iter().any(|e| e["login"] == "work"));
+    f.touch("release");
+    f.touch("complete");
+    f.wait(|f| f.events().iter().any(|e| e["login"] == "work"));
+    let auth: Value =
+        serde_json::from_slice(&fs::read(f.dir.path().join("home/auth.json")).unwrap()).unwrap();
+    assert_eq!(auth["tokens"]["account_id"], "personal");
+    assert!(f.finish().success());
+}
+
+#[test]
+fn targeted_interrupt_uses_turn_protocol() {
+    let mut f = Fixture::new("turn/start");
+    f.wait(|f| f.dir.path().join("busy").exists());
+    f.touch("release");
+    f.wait(|f| f.dir.path().join("turn_started").exists());
+    f.ok(&["switch", "work", "--session", "thread-a", "--interrupt"]);
+    f.wait(|f| f.events().iter().any(|e| e["login"] == "work"));
+    assert!(f.events().iter().any(|e| e["interrupted_turn"] == "turn-1"));
+    assert!(f.finish().success());
+}
+
+#[test]
+fn unknown_target_cannot_broadcast() {
+    let mut f = Fixture::new("idle");
+    f.wait(|f| f.dir.path().join("ready").exists());
+    let out = f
+        .command()
+        .args(["switch", "work", "--session", "bogus"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(!f.events().iter().any(|e| e["login"] == "work"));
     assert!(f.finish().success());
 }

@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use cx::{
-    auth, resets, runtime,
+    auth, resets, routing, runtime,
     state::{self, Paths, Store},
     usage,
 };
@@ -23,6 +23,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Launch Codex on an automatically selected account; put Codex arguments after --
+    Run {
+        /// Pin to an alias or unique email; never fall back
+        #[arg(long)]
+        account: Option<String>,
+        #[arg(long)]
+        label: Option<String>,
+        #[arg(long)]
+        usage_file: Option<std::path::PathBuf>,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<OsString>,
+    },
     /// Authenticate a new account and save it under an alias
     Add {
         alias: String,
@@ -38,6 +50,15 @@ enum Commands {
     },
     /// Switch to an alias (- = previous, next = least-used eligible account)
     Switch {
+        /// Move only this managed conversation or runtime ID
+        #[arg(long, conflicts_with = "from")]
+        session: Option<String>,
+        /// Move all managed sessions currently on this account
+        #[arg(long, conflicts_with = "session")]
+        from: Option<String>,
+        /// Interrupt active turns before moving; otherwise wait until idle
+        #[arg(long)]
+        interrupt: bool,
         #[arg(allow_hyphen_values = true)]
         alias: String,
         /// Accept unmanaged-session warnings (compatible with cs)
@@ -50,6 +71,8 @@ enum Commands {
     List,
     /// Show the live login and managed sessions
     Whoami,
+    /// List managed conversation IDs, accounts, labels, and pending moves
+    Sessions,
     /// Capture updated credentials after a login outside cx
     Refresh,
     /// Show each account's cached usage windows
@@ -76,7 +99,11 @@ fn main() {
         Ok(code) => std::process::exit(code),
         Err(error) => {
             eprintln!("error: {error:#}");
-            std::process::exit(1);
+            std::process::exit(
+                error
+                    .downcast_ref::<routing::Failure>()
+                    .map_or(1, |e| e.code),
+            );
         }
     }
 }
@@ -88,6 +115,23 @@ fn execute(cli: Cli) -> Result<i32> {
         return runtime::run(paths, runtime::codex_binary(), cli.codex_args);
     };
     match command {
+        Commands::Run {
+            account,
+            label,
+            usage_file,
+            args,
+        } => {
+            return runtime::run_managed(
+                paths,
+                runtime::codex_binary(),
+                args,
+                routing::RunOptions {
+                    account,
+                    label,
+                    usage_file,
+                },
+            );
+        }
         Commands::Add {
             alias,
             current,
@@ -114,7 +158,31 @@ fn execute(cli: Cli) -> Result<i32> {
             println!("Saved account '{alias}' ({email}) and set it active.");
             report_switch(&paths)?;
         }
-        Commands::Switch { alias, yes } => {
+        Commands::Switch {
+            alias,
+            yes,
+            session,
+            from,
+            interrupt,
+        } => {
+            if session.is_some() || from.is_some() {
+                for report in runtime::switch_targeted(
+                    &paths,
+                    &alias,
+                    session.as_deref(),
+                    from.as_deref(),
+                    interrupt,
+                )? {
+                    runtime::print_status(&report);
+                    if report.error.is_some() {
+                        return Ok(1);
+                    }
+                }
+                return Ok(0);
+            }
+            if interrupt {
+                bail!("--interrupt requires --session or --from");
+            }
             let target = if alias == "next" {
                 let mut candidates = store.read()?;
                 for (name, account) in &mut candidates.accounts {
@@ -174,6 +242,11 @@ fn execute(cli: Cli) -> Result<i32> {
             }
         }
         Commands::Del { alias } => {
+            if cx::sessions::Registry::new(&paths).list()?.iter().any(|r| {
+                r.account.alias == alias || r.pending.as_ref().is_some_and(|p| p.alias == alias)
+            }) {
+                bail!("'{alias}' is in use by a managed session");
+            }
             if runtime::sessions(&paths)?
                 .iter()
                 .any(|s| s.account.as_ref() == Some(&alias) || s.pending.as_ref() == Some(&alias))
@@ -182,6 +255,32 @@ fn execute(cli: Cli) -> Result<i32> {
             }
             store.transaction(|s| s.delete(&alias))?;
             println!("Removed '{alias}'. Live Codex login was left intact.");
+        }
+        Commands::Sessions => {
+            routing::import_legacy(&paths)?;
+            let runs = cx::sessions::Registry::new(&paths).list()?;
+            if runs.is_empty() {
+                println!("No managed sessions.");
+            }
+            for r in runs {
+                let ids = if r.threads.is_empty() {
+                    r.id.clone()
+                } else {
+                    r.threads.join(",")
+                };
+                println!(
+                    "{ids}  {}  pid={}  {:?}{}{}{}{}",
+                    r.account.alias,
+                    r.process.pid,
+                    r.mode,
+                    if r.pinned { " pinned" } else { "" },
+                    r.label.map(|l| format!(" label={l}")).unwrap_or_default(),
+                    r.pending
+                        .map(|p| format!(" -> {} (pending until idle)", p.alias))
+                        .unwrap_or_default(),
+                    r.error.map(|e| format!(" error={e}")).unwrap_or_default()
+                );
+            }
         }
         Commands::Whoami => {
             let state = store.read()?;
@@ -242,16 +341,14 @@ fn execute(cli: Cli) -> Result<i32> {
                 }
             }
             let state = store.read()?;
-            let sessions = if live {
-                let reports = runtime::sessions(&paths).unwrap_or_default();
-                usage::count_sessions(reports.iter().filter_map(|r| {
-                    r.account
-                        .as_deref()
-                        .map(|a| (a, r.pending.as_deref().is_some_and(|p| p != a)))
-                }))
-            } else {
-                Default::default()
-            };
+            routing::import_legacy(&paths)?;
+            let runs = cx::sessions::Registry::new(&paths).list()?;
+            let sessions = usage::count_sessions(runs.iter().map(|r| {
+                (
+                    r.account.alias.as_str(),
+                    r.pending.as_ref().is_some_and(|p| p != &r.account),
+                )
+            }));
             for line in usage::format_lines_colored(
                 &state,
                 chrono::Utc::now().timestamp(),

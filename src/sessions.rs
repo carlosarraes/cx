@@ -23,6 +23,9 @@ impl Process {
         process_start(pid).map(|start| Self { pid, start })
     }
     pub fn alive(&self) -> bool {
+        if self.pid == 0 || self.pid > i32::MAX as u32 {
+            return false;
+        }
         match Self::read(self.pid) {
             Some(p) => p == *self,
             None => unsafe {
