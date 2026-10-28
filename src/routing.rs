@@ -151,6 +151,7 @@ pub fn prepare(paths: &Paths, pin: Option<&str>) -> Result<(State, RoutingConfig
         s.accounts.insert(alias, Account { usage, ..account });
     }
     if forced.is_none() {
+        let now = chrono::Utc::now().timestamp();
         s.accounts
             .retain(|_, a| a.usage.as_ref().is_some_and(|u| eligible(u, now, &cfg)));
     }

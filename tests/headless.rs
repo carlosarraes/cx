@@ -256,3 +256,45 @@ fn termination_stops_tools_even_when_server_exits_first() {
         "tool kept running after cx released its reservation"
     );
 }
+
+#[test]
+fn automatic_routing_accepts_usage_fetched_after_selection_started() {
+    use std::io::{BufRead, BufReader, Write};
+    let (d, mut cmd) = fixture("success");
+    let path = d.path().join("data/cx/state.json");
+    let mut state: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    state["accounts"]["bot"]["usage"]["observed_at"] = json!(0);
+    fs::write(path, state.to_string()).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    cmd.env(
+        "CX_USAGE_URL",
+        format!("http://{}", listener.local_addr().unwrap()),
+    );
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut reader = BufReader::new(&mut stream);
+        loop {
+            let mut line = String::new();
+            assert!(reader.read_line(&mut line).unwrap() > 0);
+            if line == "\r\n" {
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let body = json!({"rate_limit":{"allowed":true,"primary_window":{"used_percent":1,"limit_window_seconds":604800,"reset_at":chrono::Utc::now().timestamp()+604800},"secondary_window":null}}).to_string();
+        write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).unwrap();
+    });
+    let out = cmd
+        .args(["run", "--", "exec", "--skip-git-repo-check", "hi"])
+        .output()
+        .unwrap();
+    server.join().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
