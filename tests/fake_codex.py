@@ -218,13 +218,8 @@ if scenario in ["turn/start", "review/start", "thread/compact/start", "thread/qu
     method = scenario
     send({"id": 8, "method": method, "params": {"threadId": "thread-a"}})
 while not (root / "quit").exists():
-    if scenario == "actual":
-        send({"id": "read-account", "method": "account/read", "params": {"refreshToken": False}})
     ready, _, _ = select.select([s], [], [], 0.02)
     if ready:
         msg = receive()
-        if msg.get("id") == "read-account":
-            log({"actual_email": msg["result"]["account"]["email"]})
-            time.sleep(0.05)
 s.sendall(bytes([0x88, 0x80]) + os.urandom(4))
 s.close()

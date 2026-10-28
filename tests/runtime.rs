@@ -400,23 +400,29 @@ fn termination_during_startup_cleans_both_children_and_socket() {
     );
 }
 
-/// Uses isolated homes and synthetic JWT claims: validates actual Codex account
-/// loading, without real credentials, inference, or a browser login.
+/// Checks native app-server login acknowledgements with synthetic credentials.
+/// Real workspace discovery and inference require the separate real-account smoke run.
 #[test]
 #[ignore = "requires Codex CLI on PATH; no real credentials needed"]
 fn installed_codex_applies_account_changes_without_restarting() {
     let mut f = Fixture::new("actual");
-    f.wait(|f| {
-        f.events()
-            .iter()
-            .any(|e| e["actual_email"] == "personal@example.test")
-    });
-    f.ok(&["switch", "work", "--yes"]);
-    f.wait(|f| {
-        f.events()
-            .iter()
-            .any(|e| e["actual_email"] == "work@example.test")
-    });
+    f.wait(|f| f.dir.path().join("ready").exists());
+    let before = f.ok(&["whoami"]);
+    assert!(
+        before.contains(&format!(
+            "session {}: personal (personal@example.test)",
+            f.child.as_ref().unwrap().id()
+        )),
+        "{before}"
+    );
+    let after = f.ok(&["switch", "work", "--yes"]);
+    assert!(
+        after.contains(&format!(
+            "session {}: work (work@example.test)",
+            f.child.as_ref().unwrap().id()
+        )),
+        "{after}"
+    );
     assert_eq!(
         f.events()
             .iter()
@@ -509,6 +515,30 @@ fn unknown_target_cannot_broadcast() {
         .output()
         .unwrap();
     assert!(!out.status.success());
+    assert!(!f.events().iter().any(|e| e["login"] == "work"));
+    assert!(f.finish().success());
+}
+
+#[test]
+fn later_broadcast_replaces_a_queued_target_identity() {
+    let mut f = Fixture::new("turn/start");
+    f.wait(|f| f.dir.path().join("busy").exists());
+    f.ok(&["switch", "work", "--session", "thread-a"]);
+    f.ok(&["switch", "personal", "--yes"]);
+    f.touch("release");
+    f.touch("complete");
+    std::thread::sleep(Duration::from_millis(200));
+    let registry: Value =
+        serde_json::from_slice(&fs::read(f.dir.path().join("data/cx/sessions.json")).unwrap())
+            .unwrap();
+    let run = registry["runs"]
+        .as_object()
+        .unwrap()
+        .values()
+        .next()
+        .unwrap();
+    assert_eq!(run["account"]["alias"], "personal");
+    assert_eq!(run["account"]["account_id"], "personal");
     assert!(!f.events().iter().any(|e| e["login"] == "work"));
     assert!(f.finish().success());
 }

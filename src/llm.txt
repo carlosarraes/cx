@@ -1,0 +1,65 @@
+cx: managed Codex accounts. Start sessions with automatic routing; pin only when identity matters.
+
+START
+  cx run -- [Codex interactive arguments]
+  cx run -- resume <conversation-UUID>
+  cx run --account <alias-or-unique-email> -- [arguments]
+  cx run --label <label> -- [arguments]
+Bare cx and cx -- <arguments> use the same launcher. Put Codex flags AFTER --.
+Selection checks both quota windows, freshness, reset time and live session counts.
+Recent resume affinity is preferred only while eligible. Explicit pins NEVER fall back.
+Launching does not change shared login. Installing an update does not move running sessions.
+
+INSPECT
+  cx sessions             # conversation/runtime IDs, account, PID, label, pending/error
+  cx usage [--live]        # alias (count); --live refreshes quota observations
+  cx list                 # aliases and emails; * is the shared login selection
+  cx whoami               # shared login and interactive controller identities
+Counts include interactive/headless reservations; they are not active request counts.
+
+TARGETED MOVE
+  cx switch <destination> --session <conversation-UUID-or-runtime-ID>
+  cx switch <destination> --from <source-alias-or-email>
+  cx switch <destination> --session <UUID> --interrupt
+Without --interrupt, wait for current turns to finish. --interrupt cancels the tracked
+turns and waits for completion before changing account. Targeted moves preserve the
+conversation, model and effort; they do not change shared login or unrelated sessions.
+Pinned interactive sessions can be moved explicitly. Headless moves are unsupported.
+Older launchers require reopening with updated cx run. Use cx sessions to find IDs.
+Plain cx switch <alias> changes shared login AND broadcasts to unpinned interactive
+sessions. It is not a targeted command. Avoid it when only one conversation should move.
+
+HEADLESS BOTS / QA
+  cx run --account work --label QA-123 --usage-file run.json -- exec -m MODEL -c model_reasoning_effort=high --json -o answer.txt "prompt"
+  printf '%s' 'prompt' | cx run -- exec --skip-git-repo-check -
+  cx run -- exec resume <conversation-UUID> "follow-up"
+This is an app-server adapter with a supported exec-style subset, not every codex exec flag.
+Supported: explicit exec resume UUID, -m/--model, -c/--config key=value,
+-C/--cd, -s/--sandbox, --json, -o/--output-last-message, --output-schema,
+--skip-git-repo-check, --add-dir, --ephemeral,
+--dangerously-bypass-approvals-and-sandbox. Unsupported flags fail before work.
+Config auth/provider overrides are rejected. Approval policy is never; interactive
+approval/input requests fail. Existing Codex config supplies other defaults.
+Normal stdout contains the final answer; --json emits thread/turn/item JSONL events.
+JSONL covers core app-server items; it is not byte-for-byte native exec JSONL compatibility.
+cx errors go to stderr. Prompt may come from stdin. Usage files are private atomic JSON.
+Records contain identity, label, thread, times, requested/resolved model and effort,
+observed reroutes, per-run token counters when available, exit code and outcome.
+Resolved model is app-server evidence, NOT backend attestation. Missing evidence is
+null with a reason. Resumed usage is null if no pre-turn token baseline was observed.
+Observed model/effort mismatch fails; no automatic replay or account recovery occurs.
+Exit codes: 0 success; 1 task failure; 2 invalid arguments; 20 quota/rate limit;
+21 authentication; 22 model/effort mismatch; 23 concurrency capacity;
+70 launcher/protocol/report error; 130 interrupted; 143 terminated.
+
+CONFIGURATION
+$XDG_CONFIG_HOME/cx/config.toml (default ~/.config/cx/config.toml):
+  [routing]
+  usage_max_age_seconds = 300
+  affinity_seconds = 3600
+  max_headless_per_account = 2
+Affinity duration is routing policy, not a claimed Codex cache TTL.
+Credentials: $XDG_DATA_HOME/cx/state.json. Never print/copy its contents into messages.
+Registry: $XDG_DATA_HOME/cx/sessions.json; excludes tokens. CODEX_HOME is honored.
+CX_CODEX_BIN selects the Codex executable. Update Codex if app-server protocol fails.
+Never compile cs/cx on mac. just sync mac builds on mact and installs on mac.

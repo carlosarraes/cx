@@ -11,10 +11,13 @@ use std::ffi::OsString;
 #[command(
     name = "cx",
     version,
-    about = "Switch between Codex accounts",
+    about = "Route Codex sessions across accounts and switch selected conversations",
     after_help = "With no subcommand, launch Codex with live account switching.\nPass Codex arguments after --, e.g. cx -- resume --last."
 )]
 struct Cli {
+    /// Print concise agent instructions and supported bot interfaces
+    #[arg(long)]
+    llm: bool,
     #[command(subcommand)]
     command: Option<Commands>,
     #[arg(last = true)]
@@ -48,7 +51,7 @@ enum Commands {
         #[arg(long, conflicts_with = "current")]
         device_auth: bool,
     },
-    /// Switch to an alias (- = previous, next = least-used eligible account)
+    /// Change shared login and broadcast, or target --session / --from
     Switch {
         /// Move only this managed conversation or runtime ID
         #[arg(long, conflicts_with = "from")]
@@ -109,6 +112,10 @@ fn main() {
 }
 
 fn execute(cli: Cli) -> Result<i32> {
+    if cli.llm {
+        print!("{}", include_str!("llm.txt"));
+        return Ok(0);
+    }
     let paths = Paths::discover()?;
     let store = Store::new(paths.clone());
     let Some(command) = cli.command else {

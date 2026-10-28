@@ -2,9 +2,10 @@
 
 Switch between Codex accounts with the same commands as [cs](https://github.com/carlosarraes/cs).
 
-Run `cx` to open the native Codex terminal UI. From another terminal, run
-`cx switch work` to change its account without restarting it. Busy sessions
-finish their current turn before applying the change.
+Run `cx` or `cx run -- ...` to open the native Codex terminal UI on an automatically
+selected account. From another terminal, use `cx sessions` to find its conversation
+ID, then `cx switch work --session <ID>` to move it. Busy sessions finish their
+current turn before applying the change. `--interrupt` cancels the turn first.
 
 Rust. Linux and macOS. ChatGPT OAuth accounts.
 
@@ -50,12 +51,17 @@ like `cs add`. The browser must sign in to the intended account.
 
 | Command | Behavior |
 | --- | --- |
-| `cx` | Launch native Codex with live account switching |
+| `cx` / `cx run -- <args>` | Launch native Codex with automatic account selection |
+| `cx run --account <alias-or-email> -- <args>` | Pin identity, with no fallback |
+| `cx sessions` | Show managed conversation IDs, accounts, labels and pending moves |
+| `cx switch work --session <UUID> [--interrupt]` | Move one interactive conversation |
+| `cx switch work --from personal [--interrupt]` | Move all sessions on an account |
+| `cx --llm` | Concise agent instructions, supported headless flags and exit codes |
 | `cx -- resume --last` | Resume the latest conversation with live switching |
 | `cx -- -C /path/to/project` | Start in another project |
 | `cx add <alias> [--current] [--force]` | Save and activate an account |
 | `cx add <alias> --device-auth` | Use Codex device-code login |
-| `cx switch <alias>` | Select an account and notify every managed session |
+| `cx switch <alias>` | Change shared login and broadcast to unpinned interactive sessions |
 | `cx switch -` | Toggle to the previous account |
 | `cx switch next` | Fetch usage and select another eligible account with lowest primary-window usage |
 | `cx list` | List aliases, `*` current and `-` previous |
@@ -70,8 +76,8 @@ like `cs add`. The browser must sign in to the intended account.
 Usage follows the `cs` layout, with aligned aliases and reset countdowns:
 
 ```text
-- personal  5h 10% (resets 2h53m) · 7d 94% (resets 1d3h) · idle 13m
-* work      7d 83% (resets 5d11h) · running 1h18m
+personal (2)  5h 10% (resets 2h53m) · 7d 94% (resets 1d3h) · idle 13m
+work     (0)  7d 83% (resets 5d11h) · running 1h18m
 ```
 
 Window labels come from Codex's reported duration. Accounts with only a weekly
@@ -87,13 +93,51 @@ minutes also show `as of ... ago`.
 unmanaged-session reminder; it never interrupts an active turn.
 
 Native Codex arguments go after `--`. Interactive launches, `resume`, and `fork`
-use the remote TUI transport. There is no `cx run` subcommand. For `codex exec`
-and other noninteractive commands, use Codex directly.
+use the remote TUI transport. `cx run -- exec ...` uses a non-interactive app-server
+adapter with an explicit supported subset of exec-style flags. Run `cx --llm` for
+that list, JSONL compatibility limits and outcome codes.
 
 Usage windows are colored in interactive terminals: green below 70%, yellow
 from 70% to below 90%, red from 90%, and bold red at 100% or above. Each window's
 percentage and reset countdown share its color. Piped output stays plain;
 `NO_COLOR=1` or `TERM=dumb` disables colors.
+
+## Smart routing and bots
+
+New runs check all reported quota windows and refresh stale observations. Eligible
+accounts are ranked by live session count, then remaining quota per hour until
+reset, then alias. Reservations are atomic, so concurrent starts see each other.
+Recent conversation affinity is preferred only while that identity remains eligible.
+An exhausted account does not trap a resumed conversation. Explicit pins never fall back.
+
+```sh
+cx run --account work --label QA-123 --usage-file run.json -- exec -m MODEL -c model_reasoning_effort=high --json -o answer.txt "prompt"
+```
+
+Headless runs use the same account registry and have a per-account concurrency cap.
+The adapter fails on unsupported arguments or interactive approval requests.
+JSON stdout contains core thread, turn and item events; it is not a full native
+`codex exec` JSONL replacement. Routing messages and errors use stderr.
+
+Usage records are written atomically, including failures. Requested/resolved model
+and effort are separate fields. App-server model evidence is not backend attestation;
+observed mismatches fail. Missing token evidence stays null with a reason. Resumed
+runs subtract a pre-turn baseline when available rather than reporting historical
+tokens as new usage. `native_exit_status` is null because no native exec is launched.
+
+Configure `$XDG_CONFIG_HOME/cx/config.toml` or `~/.config/cx/config.toml`:
+
+```toml
+[routing]
+usage_max_age_seconds = 300
+affinity_seconds = 3600
+max_headless_per_account = 2
+```
+
+The affinity interval is routing policy, not a claim about Codex cache lifetime.
+Session counts include launches reserved before the model starts. Installing the
+binary does not move existing sessions. Older controllers remain visible but must
+be reopened with updated `cx run` before targeted switching works.
 
 ## Live switching
 
@@ -133,13 +177,13 @@ does not qualify an account for `switch next`. A failed live usage check also
 excludes that account from the selection, even when cached usage exists.
 
 The live-login protocol is **unstable** in Codex. Tested against Codex CLI
-`0.154.0`; an incompatible version produces an explicit error. The installed
-Codex smoke test verifies changing synthetic account identities in the same
-app-server. Real account authentication and model requests still require a
-manual two-account check.
+`0.164.0`; an incompatible version produces an explicit error. The installed
+Codex smoke test verifies login acknowledgements for synthetic identities in the
+same app-server. Authenticated workspace discovery and model requests require
+a separate real-account smoke run.
 
-Version 0.1 covers manual switching. Automatic rotation, service installation,
-logs commands, and session snapshots are follow-up work.
+Automatic mid-run quota recovery, service installation, logs commands and session
+snapshots remain follow-up work. No failed task is automatically replayed.
 
 ## Development
 

@@ -181,6 +181,9 @@ pub fn run_managed(
     args: Vec<OsString>,
     options: RunOptions,
 ) -> Result<i32> {
+    if args.first().is_some_and(|s| s == "exec") {
+        return crate::headless::run(paths, codex, args, options);
+    }
     if options.usage_file.is_some() {
         anyhow::bail!("--usage-file requires a headless exec run");
     }
@@ -546,6 +549,7 @@ async fn relay(
                     match store.read().and_then(|s| s.current.context("no selected account")) {
                         Ok(alias) => {
                             desired_revision += 1;
+                            reservation.status(None, None)?;
                             status.pending = Some(alias);
                             status.error = None;
                             if turns.busy() || !initialized { let _ = control.reply.send(status.clone()); }
