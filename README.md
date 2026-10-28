@@ -149,24 +149,34 @@ The Justfile is copied from `cs`, with the binary name changed to `cx`.
 just check                   # formatting, Clippy, tests
 just run list
 just build
-just sync                    # install locally and on mac, no release needed
-just sync another-host       # use another SSH host alias
+just sync                    # build on mact, install on mac; no local build
+just sync destination builder # builder must match destination OS/architecture
 
 # Optional installed-Codex protocol smoke test, using synthetic credentials:
 cargo test --test runtime installed_codex_applies_account_changes_without_restarting -- --ignored
 ```
 
 Integration tests use temporary homes, local HTTP fixtures, and fake Codex
-subprocesses communicating over real Unix WebSockets. Python 3 is needed for
-the fake subprocess fixture; no third-party Python packages are used.
+subprocesses communicating over real Unix WebSockets. Tests require Python 3
+and just; no third-party Python packages are used. Sync tests mock SSH, rsync
+and scp, so they never connect to or compile on a real host.
 
-`just sync` installs the current working tree, including uncommitted changes.
-It copies the binary when OS and architecture match; otherwise it syncs only
-Cargo manifests, the Rust toolchain file, and `src/` into `~/.cache/cx-src` on
-the host and builds there. The remote Cargo build cache is reused. The new
-binary is checked before replacing `~/.local/bin/cx`; credentials and account
-state stay on their own machine. The destination needs SSH and, for a native
-build, rsync and Rust via rustup.
+Never compile cs or cx on `mac`, Carlos's busy MacBook Air.
+`just sync` defaults to `just sync mac mact`. It sends the current source,
+including uncommitted changes, to a private source directory under `~/.cache/cx-build` on `mact` and builds there.
+It copies the binary through the caller and atomically installs it on `mac`.
+Sync never compiles on the destination or implicitly builds/installs locally.
+
+For another platform, pass a matching builder: `just sync DESTINATION BUILDER`.
+Mismatched OS/architecture, failed builds or failed transfers leave the installed
+binary untouched. The caller needs SSH, rsync and scp access to both hosts; the
+remotes do not need SSH access to each other. Only the builder needs Rust/rustup and Python 3.
+Existing checkouts and account credentials are not copied or overwritten.
+Concurrent syncs have separate sources and artifacts. A lock protects the shared
+Cargo cache through compilation and artifact capture. Temporary sources are removed.
+
+Local compilation recipes refuse Carlos's Mac by hostname or the persistent
+`~/.config/cx/no-build` marker. Use `just build` only on permitted hosts.
 
 Sync does not bump `Cargo.toml`, commit, push, tag, or create a GitHub release.
 `cx --version` stays at the package version even when you sync newer code.
