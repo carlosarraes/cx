@@ -542,3 +542,43 @@ fn later_broadcast_replaces_a_queued_target_identity() {
     assert!(!f.events().iter().any(|e| e["login"] == "work"));
     assert!(f.finish().success());
 }
+
+#[test]
+fn batch_move_reports_successes_after_an_earlier_failure() {
+    let mut f = Fixture::with_args("reject", &["run", "--account", "personal"]);
+    f.wait(|f| f.dir.path().join("ready").exists());
+    let mut second = f
+        .command()
+        .args(["run", "--account", "personal"])
+        .env("CX_TEST_SCENARIO", "idle")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    f.wait(|f| {
+        f.events()
+            .iter()
+            .filter(|e| e["login"] == "personal")
+            .count()
+            == 2
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    let out = f
+        .command()
+        .args(["switch", "work", "--from", "personal"])
+        .output()
+        .unwrap();
+    unsafe {
+        libc::kill(second.id() as i32, libc::SIGTERM);
+    }
+    let _ = second.wait();
+    let _ = f.finish();
+    assert!(!out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(
+        stdout.lines().filter(|l| l.starts_with("session ")).count(),
+        2,
+        "{stdout}"
+    );
+}

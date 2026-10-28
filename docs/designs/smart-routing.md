@@ -1,6 +1,6 @@
 # Smart routing and managed runs for cx
 
-Status: approved scope on 2026-10-27. Implementation plan prepared; no runtime changes yet.
+Status: implemented and verified on Linux and Darwin/ARM64, 2026-10-27. Built on mact and synced to mac without a version bump.
 
 ## Outcome
 

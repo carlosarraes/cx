@@ -173,6 +173,7 @@ fn execute(cli: Cli) -> Result<i32> {
             interrupt,
         } => {
             if session.is_some() || from.is_some() {
+                let mut failed = false;
                 for report in runtime::switch_targeted(
                     &paths,
                     &alias,
@@ -181,11 +182,9 @@ fn execute(cli: Cli) -> Result<i32> {
                     interrupt,
                 )? {
                     runtime::print_status(&report);
-                    if report.error.is_some() {
-                        return Ok(1);
-                    }
+                    failed |= report.error.is_some();
                 }
-                return Ok(0);
+                return Ok(i32::from(failed));
             }
             if interrupt {
                 bail!("--interrupt requires --session or --from");
