@@ -234,3 +234,5 @@ SHA-256 checksums on GitHub.
 [MIT](LICENSE)
 
 `cx t3-codex` and the `cx-t3-codex` symlink pass t3 arguments and stdio through to Codex after account routing. `cx pick` names the routed account without launching Codex.
+
+Borrow owner-routed credentials with `--borrow <host>` or `CX_BORROW` on run, t3-codex, or pick. CLI overrides the environment. The owner provides `cx lend` and idempotent `cx lend-release <lease_id>`. Only the access token crosses SSH; borrowed credentials stay in a private temporary overlay and never sync back.

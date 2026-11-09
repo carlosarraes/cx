@@ -247,6 +247,7 @@ pub fn reserve_prepared(
         s.runs.insert(
             id.clone(),
             ManagedSession {
+                expires_at: None,
                 id: id.clone(),
                 process,
                 account: identity.clone(),
@@ -322,6 +323,7 @@ pub fn import_legacy(paths: &Paths) -> Result<()> {
             s.runs.insert(
                 id.clone(),
                 ManagedSession {
+                    expires_at: None,
                     id,
                     process,
                     account: Identity::new(&alias, account),

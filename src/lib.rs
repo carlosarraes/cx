@@ -12,3 +12,5 @@ pub mod sessions;
 pub mod headless;
 
 pub mod passthrough;
+
+pub mod borrow;

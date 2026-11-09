@@ -32,7 +32,19 @@ pub fn pick(paths: &Paths) -> Result<i32> {
 }
 
 pub fn run(paths: Paths, args: Vec<OsString>) -> Result<i32> {
-    let reservation = reserve(&paths)?;
+    run_overlay(paths, args, None)
+}
+
+pub fn run_overlay(
+    paths: Paths,
+    args: Vec<OsString>,
+    borrowed: Option<&crate::borrow::Grant>,
+) -> Result<i32> {
+    let reservation = if borrowed.is_some() {
+        None
+    } else {
+        reserve(&paths)?
+    };
     let mut overlay = None;
     if let Some(reservation) = &reservation {
         let identity = reservation.get()?.account;
@@ -63,6 +75,36 @@ pub fn run(paths: Paths, args: Vec<OsString>) -> Result<i32> {
             &account,
         )?;
         eprintln!("cx: t3-codex -> {} ({})", identity.alias, identity.email);
+        overlay = Some(home);
+    }
+    if let Some(grant) = borrowed {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir()?;
+        fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700))?;
+        let config_path = paths.codex_home.join("config.toml");
+        let mut config = if config_path.exists() {
+            fs::read_to_string(config_path)?.parse::<toml::Table>()?
+        } else {
+            toml::Table::new()
+        };
+        config.insert("cli_auth_credentials_store".into(), "file".into());
+        fs::write(home.path().join("config.toml"), toml::to_string(&config)?)?;
+        if paths.codex_home.exists() {
+            for entry in fs::read_dir(&paths.codex_home)? {
+                let entry = entry?;
+                if entry.file_name() != "auth.json" && entry.file_name() != "config.toml" {
+                    std::os::unix::fs::symlink(entry.path(), home.path().join(entry.file_name()))?;
+                }
+            }
+        }
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(home.path().join("auth.json"))?;
+        file.write_all(serde_json::to_string(&serde_json::json!({"auth_mode":"chatgpt","tokens":{"access_token":grant.access_token,"account_id":grant.account_id}}))?.as_bytes())?;
         overlay = Some(home);
     }
     let result = tokio::runtime::Runtime::new()?.block_on(async {
@@ -118,6 +160,9 @@ pub fn run(paths: Paths, args: Vec<OsString>) -> Result<i32> {
                 Ok(())
             })?;
         }
+    }
+    if let Some(grant) = borrowed {
+        grant.release_remote();
     }
     result
 }

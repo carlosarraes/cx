@@ -512,3 +512,118 @@ raise SystemExit(int(os.environ.get("FAKE_EXIT", "0")))
     }
     assert_eq!(cx::sessions::Registry::new(&paths).list().unwrap().len(), 1);
 }
+
+#[test]
+fn borrowed_overlay_is_private_and_released() {
+    use std::os::unix::fs::PermissionsExt;
+    for code in [0, 7, 143] {
+        let dir = TempDir::new().unwrap();
+        auth(&dir, "local");
+        let shared = dir.path().join("codex/auth.json");
+        let before = fs::read(&shared).unwrap();
+        let ssh = dir.path().join("ssh");
+        fs::write(&ssh, r#"#!/bin/sh
+printf '%s\n' "$@" >> "$RECORD"
+case "$*" in
+*lend-release*) exit 0;;
+esac
+printf '{"alias":"owner","email":"owner@example.test","account_id":"owner","lease_id":"lease-1","expires_at":4102444800,"access_token":"test-access-aaa"}'
+"#).unwrap();
+        let codex = dir.path().join("codex-stub");
+        fs::write(
+            &codex,
+            r#"#!/usr/bin/env python3
+import os, pathlib, json, sys, signal
+p = pathlib.Path(os.environ["CODEX_HOME"])
+assert p.stat().st_mode & 0o777 == 0o700
+a = p / "auth.json"
+assert a.stat().st_mode & 0o777 == 0o600
+v = json.loads(a.read_text())
+assert v["tokens"]["access_token"] == "test-access-aaa"
+assert "refresh_token" not in a.read_text()
+assert 'cli_auth_credentials_store = "file"' in (p / "config.toml").read_text()
+assert sys.argv[1:] == ["app-server"]
+pathlib.Path(os.environ["OVERLAY"]).write_text(str(p))
+print("MARKER", flush=True)
+code = int(os.environ["CHILD_CODE"])
+if code == 143: os.kill(os.getpid(), signal.SIGTERM)
+sys.exit(code)
+"#,
+        )
+        .unwrap();
+        for p in [&ssh, &codex] {
+            fs::set_permissions(p, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let record = dir.path().join("record");
+        let overlay = dir.path().join("overlay");
+        let out = cli(&dir, &["t3-codex", "app-server", "--borrow=owner"])
+            .env("CX_SSH", ssh)
+            .env("CX_CODEX_BIN", codex)
+            .env("RECORD", &record)
+            .env("OVERLAY", &overlay)
+            .env("CHILD_CODE", code.to_string())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(code));
+        assert!(out.stdout.starts_with(b"MARKER"));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!stderr.contains("test-access-aaa"));
+        assert!(!stderr.contains("secret-refresh"));
+        assert_eq!(fs::read(shared).unwrap(), before);
+        assert!(!dir.path().join("data/cx/state.json").exists());
+        assert!(!std::path::Path::new(&fs::read_to_string(overlay).unwrap()).exists());
+        let calls = fs::read_to_string(record).unwrap();
+        assert!(calls.contains("BatchMode=yes"));
+        assert!(calls.contains("ControlPath=none"));
+        assert!(calls.contains("lend-release 'lease-1'"));
+    }
+}
+
+#[test]
+fn lend_survives_owner_exit_and_release_is_idempotent() {
+    let dir = TempDir::new().unwrap();
+    assert!(!command(&dir, &["lend"]).status.success());
+    for alias in ["a", "b"] {
+        auth(&dir, alias);
+        success(command(&dir, &["add", alias, "--current"]));
+    }
+    let path = dir.path().join("data/cx/state.json");
+    let mut state: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let now = chrono::Utc::now().timestamp();
+    for alias in ["a", "b"] {
+        state["accounts"][alias]["usage"] = json!({
+            "primary":{"used_percent":10,"resets_at":now+3600,"limit_window_seconds":18000},
+            "secondary":null,"observed_at":now,"allowed":true
+        });
+    }
+    fs::write(path, serde_json::to_vec(&state).unwrap()).unwrap();
+    let out = command(&dir, &["lend"]);
+    assert!(out.status.success());
+    let grant: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(grant.get("refresh_token").is_none());
+    assert!(grant.get("id_token").is_none());
+    assert!(!String::from_utf8_lossy(&out.stderr).contains(grant["access_token"].as_str().unwrap()));
+    assert_eq!(success(command(&dir, &["pick"])), "b b@example.test\n");
+    let id = grant["lease_id"].as_str().unwrap();
+    success(command(&dir, &["lend-release", id]));
+    success(command(&dir, &["lend-release", id]));
+    assert_eq!(success(command(&dir, &["pick"])), "a a@example.test\n");
+}
+
+#[test]
+fn invalid_lend_response_does_not_echo_credentials() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new().unwrap();
+    let ssh = dir.path().join("ssh");
+    fs::write(&ssh, "#!/bin/sh\nprintf 'test-access-aaa invalid json'\n").unwrap();
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+    let out = cli(&dir, &["pick", "--borrow", "owner"])
+        .env("CX_SSH", ssh)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("invalid lend response from owner"));
+    assert!(!stderr.contains("test-access-aaa"));
+}

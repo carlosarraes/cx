@@ -91,6 +91,8 @@ pub enum Mode {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ManagedSession {
+    #[serde(default)]
+    pub expires_at: Option<i64>,
     pub id: String,
     pub process: Process,
     pub account: Identity,
@@ -143,7 +145,10 @@ impl Registry {
             Err(e) => return Err(e.into()),
         };
         let before = serde_json::to_vec(&s)?;
-        s.runs.retain(|_, r| r.process.alive());
+        s.runs.retain(|_, r| {
+            r.expires_at
+                .map_or_else(|| r.process.alive(), |t| chrono::Utc::now().timestamp() < t)
+        });
         let result = f(&mut s)?;
         let bytes = serde_json::to_vec(&s)?;
         if bytes != before {
@@ -226,7 +231,9 @@ impl Reservation {
 impl Drop for Reservation {
     fn drop(&mut self) {
         let _ = self.registry.update(|s| {
-            s.runs.remove(&self.id);
+            if s.runs.get(&self.id).is_none_or(|r| r.expires_at.is_none()) {
+                s.runs.remove(&self.id);
+            }
             Ok(())
         });
     }

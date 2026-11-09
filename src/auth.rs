@@ -246,7 +246,7 @@ fn read_account(path: &std::path::Path) -> Result<Account> {
     })
 }
 
-fn jwt_claims(token: &str) -> Result<Value> {
+pub(crate) fn jwt_claims(token: &str) -> Result<Value> {
     let payload = token.split('.').nth(1).context("token is not a JWT")?;
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(payload)

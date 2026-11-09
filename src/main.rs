@@ -33,6 +33,10 @@ enum Commands {
     },
     /// Name the automatically routed account without launching
     Pick,
+    Lend,
+    LendRelease {
+        lease_id: String,
+    },
     /// Launch Codex on an automatically selected account; put Codex arguments after --
     Run {
         /// Pin to an alias or unique email; never fall back
@@ -76,7 +80,9 @@ enum Commands {
         yes: bool,
     },
     /// Forget an alias without logging out
-    Del { alias: String },
+    Del {
+        alias: String,
+    },
     /// List saved aliases (* = current, - = previous)
     List,
     /// Show the live login and managed sessions
@@ -91,7 +97,9 @@ enum Commands {
         live: bool,
     },
     /// List rate-limit reset credits, soonest expiry first
-    Resets { alias: Option<String> },
+    Resets {
+        alias: Option<String>,
+    },
     /// Spend a reset credit (default: current account, soonest-expiring credit)
     Reset {
         alias: Option<String>,
@@ -112,7 +120,25 @@ fn main() {
     {
         args.insert(1, "t3-codex".into());
     }
-    match execute(Cli::parse_from(args)) {
+    let borrowed = cx::borrow::extract(&mut args);
+    let result = borrowed.and_then(|host| {
+        let cli = Cli::parse_from(args);
+        if let Some(host) = host {
+            let paths = Paths::discover()?;
+            return match cli.command {
+                Some(Commands::Pick) => cx::borrow::pick(&host),
+                Some(Commands::T3Codex { args }) => cx::borrow::run(paths, &host, args),
+                Some(Commands::Run { account, args, .. }) => {
+                    anyhow::ensure!(account.is_none(), "--borrow conflicts with --account");
+                    cx::borrow::run(paths, &host, args)
+                }
+                None => cx::borrow::run(paths, &host, cli.codex_args),
+                _ => anyhow::bail!("--borrow requires run, t3-codex, or pick"),
+            };
+        }
+        execute(cli)
+    });
+    match result {
         Ok(code) => std::process::exit(code),
         Err(error) => {
             eprintln!("error: {error:#}");
@@ -136,6 +162,11 @@ fn execute(cli: Cli) -> Result<i32> {
         return runtime::run(paths, runtime::codex_binary(), cli.codex_args);
     };
     match command {
+        Commands::Lend => return cx::borrow::lend(&paths),
+        Commands::LendRelease { lease_id } => {
+            cx::borrow::release(&paths, &lease_id)?;
+            return Ok(0);
+        }
         Commands::T3Codex { args } => return cx::passthrough::run(paths, args),
         Commands::Pick => return cx::passthrough::pick(&paths),
         Commands::Run {
