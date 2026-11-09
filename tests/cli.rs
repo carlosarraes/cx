@@ -398,7 +398,7 @@ fn passthrough_fallback_preserves_arguments_stdio_and_alias_dispatch() {
         .arg("app-server")
         .env("XDG_DATA_HOME", dir.path().join("data"))
         .env("CODEX_HOME", dir.path().join("codex"))
-        .env("CX_CODEX_BIN", stub)
+        .env("CX_CODEX_BIN", &stub)
         .output()
         .unwrap();
     assert!(output.status.success());
@@ -449,19 +449,26 @@ fn routed_passthrough_isolates_credentials_and_matches_pick() {
     fs::write(
         &stub,
         r#"#!/usr/bin/env python3
-import os, pathlib, stat
+import json, os, pathlib, signal, stat
 home = pathlib.Path(os.environ["CODEX_HOME"])
 assert stat.S_IMODE(home.stat().st_mode) == 0o700
 assert stat.S_IMODE((home / "auth.json").stat().st_mode) == 0o600
 assert 'cli_auth_credentials_store = "file"' in (home / "config.toml").read_text()
 print("MARKER", flush=True)
 print(home)
+auth_path = home / "auth.json"
+blob = json.loads(auth_path.read_text())
+blob["tokens"]["refresh_token"] = os.environ.get("FAKE_ROTATED_TOKEN", "fake-rotated-refresh-token")
+auth_path.write_text(json.dumps(blob))
+if os.environ.get("FAKE_EXIT") == "signal":
+    os.kill(os.getpid(), signal.SIGTERM)
+raise SystemExit(int(os.environ.get("FAKE_EXIT", "0")))
 "#,
     )
     .unwrap();
     fs::set_permissions(&stub, fs::Permissions::from_mode(0o700)).unwrap();
     let output = cli(&dir, &["t3-codex", "app-server"])
-        .env("CX_CODEX_BIN", stub)
+        .env("CX_CODEX_BIN", &stub)
         .output()
         .unwrap();
     assert!(
@@ -477,8 +484,31 @@ print(home)
     assert!(!std::path::Path::new(lines[1]).exists());
     assert_eq!(fs::read(&auth_path).unwrap(), before);
     assert_eq!(
-        fs::metadata(auth_path).unwrap().modified().unwrap(),
+        fs::metadata(&auth_path).unwrap().modified().unwrap(),
         modified
     );
+    let saved = cx::state::Store::new(paths.clone()).read().unwrap();
+    assert!(saved.accounts["b"].data["tokens"]["refresh_token"]
+        .as_str()
+        .is_some_and(|token| token == "fake-rotated-refresh-token"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("fake-rotated-refresh-token"));
+    assert!(!stderr.contains("secret-refresh"));
+    for (exit, code) in [("7", 7), ("signal", 143)] {
+        let token = format!("fake-rotated-token-{exit}");
+        let output = cli(&dir, &["t3-codex", "app-server"])
+            .env("CX_CODEX_BIN", &stub)
+            .env("FAKE_ROTATED_TOKEN", &token)
+            .env("FAKE_EXIT", exit)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(code));
+        let saved = cx::state::Store::new(paths.clone()).read().unwrap();
+        assert!(saved.accounts["b"].data["tokens"]["refresh_token"]
+            .as_str()
+            .is_some_and(|value| value == token));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains(&token));
+        assert_eq!(fs::read(&auth_path).unwrap(), before);
+    }
     assert_eq!(cx::sessions::Registry::new(&paths).list().unwrap().len(), 1);
 }

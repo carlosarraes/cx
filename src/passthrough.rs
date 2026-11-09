@@ -3,7 +3,7 @@ use crate::{
     sessions::{Mode, Reservation},
     state::{Paths, Store},
 };
-use anyhow::Result;
+use anyhow::{ensure, Context, Result};
 use std::{ffi::OsString, fs, os::unix::process::ExitStatusExt, process::Stdio};
 use tokio::signal::unix::{signal, SignalKind};
 
@@ -65,7 +65,7 @@ pub fn run(paths: Paths, args: Vec<OsString>) -> Result<i32> {
         eprintln!("cx: t3-codex -> {} ({})", identity.alias, identity.email);
         overlay = Some(home);
     }
-    tokio::runtime::Runtime::new()?.block_on(async {
+    let result = tokio::runtime::Runtime::new()?.block_on(async {
         let mut interrupt = signal(SignalKind::interrupt())?;
         let mut terminate = signal(SignalKind::terminate())?;
         let mut hangup = signal(SignalKind::hangup())?;
@@ -95,5 +95,29 @@ pub fn run(paths: Paths, args: Vec<OsString>) -> Result<i32> {
         Ok(status
             .code()
             .unwrap_or_else(|| 128 + status.signal().unwrap_or(1)))
-    })
+    });
+    if let (Some(home), Some(reservation)) = (&overlay, &reservation) {
+        if home.path().join("auth.json").exists() {
+            let identity = reservation.get()?.account;
+            let updated = auth::import_current(&Paths {
+                data: paths.data.clone(),
+                codex_home: home.path().into(),
+            })
+            .map_err(|_| anyhow::anyhow!("cannot read updated overlay credentials"))?;
+            ensure!(
+                identity.matches(&updated),
+                "overlay account identity changed"
+            );
+            Store::new(paths.clone()).transaction(|state| {
+                let saved = state
+                    .accounts
+                    .get_mut(&identity.alias)
+                    .context("selected account disappeared before credential sync")?;
+                ensure!(identity.matches(saved), "saved account identity changed");
+                saved.data = updated.data;
+                Ok(())
+            })?;
+        }
+    }
+    result
 }
