@@ -232,3 +232,5 @@ SHA-256 checksums on GitHub.
 ## License
 
 [MIT](LICENSE)
+
+`cx t3-codex` and the `cx-t3-codex` symlink pass t3 arguments and stdio through to Codex after account routing. `cx pick` names the routed account without launching Codex.

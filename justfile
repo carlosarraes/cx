@@ -32,6 +32,7 @@ build: assert-build-host
     install -m 755 target/release/{{binary_name}} "$pending"
     "$pending" --version
     mv -f "$pending" "{{install_dir}}/{{binary_name}}"
+    ln -sfn cx "{{install_dir}}/cx-t3-codex"
     echo "Installed {{binary_name}} -> {{install_dir}}/{{binary_name}}"
 
 # Build on a separate host, then atomically install on the destination.
@@ -120,6 +121,7 @@ sync host="mac" builder="mact":
     chmod 755 "$pending"
     "$pending" --version
     mv -f "$pending" "$HOME/.local/bin/cx"
+    ln -sfn cx "$HOME/.local/bin/cx-t3-codex"
     echo "Installed $HOME/.local/bin/cx"
     SH
     pending=""

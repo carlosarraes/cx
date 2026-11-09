@@ -363,3 +363,122 @@ fn reset_spends_the_soonest_expiring_credit_after_confirmation() {
     assert_eq!(consume["credit_id"], "soon");
     assert_eq!(consume["redeem_request_id"].as_str().unwrap().len(), 36);
 }
+
+#[test]
+fn passthrough_fallback_preserves_arguments_stdio_and_alias_dispatch() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    let dir = TempDir::new().unwrap();
+    auth(&dir, "current");
+    let auth_path = dir.path().join("codex/auth.json");
+    let before = fs::read(&auth_path).unwrap();
+    let modified = fs::metadata(&auth_path).unwrap().modified().unwrap();
+    let stub = dir.path().join("codex-stub");
+    fs::write(
+        &stub,
+        "#!/bin/sh\nprintf 'MARKER\\n'\nprintf '%s\\n' \"$CODEX_HOME\" \"$@\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&stub, fs::Permissions::from_mode(0o700)).unwrap();
+    let output = cli(&dir, &["t3-codex", "app-server", "-c", "foo=bar"])
+        .env("CX_CODEX_BIN", &stub)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!(
+            "MARKER\n{}\napp-server\n-c\nfoo=bar\n",
+            dir.path().join("codex").display()
+        )
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("fallback"));
+    let alias = dir.path().join("cx-t3-codex");
+    symlink(env!("CARGO_BIN_EXE_cx"), &alias).unwrap();
+    let output = Command::new(alias)
+        .arg("app-server")
+        .env("XDG_DATA_HOME", dir.path().join("data"))
+        .env("CODEX_HOME", dir.path().join("codex"))
+        .env("CX_CODEX_BIN", stub)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(output.stdout.starts_with(b"MARKER\n"));
+    assert_eq!(success(command(&dir, &["pick"])), "current\n");
+    assert_eq!(fs::read(&auth_path).unwrap(), before);
+    assert_eq!(
+        fs::metadata(auth_path).unwrap().modified().unwrap(),
+        modified
+    );
+}
+
+#[test]
+fn routed_passthrough_isolates_credentials_and_matches_pick() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new().unwrap();
+    for alias in ["a", "b"] {
+        auth(&dir, alias);
+        success(command(&dir, &["add", alias, "--current"]));
+    }
+    let path = dir.path().join("data/cx/state.json");
+    let mut state: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let now = chrono::Utc::now().timestamp();
+    for alias in ["a", "b"] {
+        state["accounts"][alias]["usage"] = json!({
+            "primary":{"used_percent":10,"resets_at":now+3600,"limit_window_seconds":18000},
+            "secondary":null,"observed_at":now,"allowed":true
+        });
+    }
+    fs::write(path, serde_json::to_vec(&state).unwrap()).unwrap();
+    let paths = cx::state::Paths {
+        data: dir.path().join("data/cx"),
+        codex_home: dir.path().join("codex"),
+    };
+    let reserved = cx::routing::reserve(
+        &paths,
+        &cx::routing::RunOptions::default(),
+        None,
+        cx::sessions::Mode::Interactive,
+    )
+    .unwrap();
+    assert_eq!(reserved.get().unwrap().account.alias, "a");
+    assert_eq!(success(command(&dir, &["pick"])), "b b@example.test\n");
+    let auth_path = paths.codex_home.join("auth.json");
+    let before = fs::read(&auth_path).unwrap();
+    let modified = fs::metadata(&auth_path).unwrap().modified().unwrap();
+    let stub = dir.path().join("stub");
+    fs::write(
+        &stub,
+        r#"#!/usr/bin/env python3
+import os, pathlib, stat
+home = pathlib.Path(os.environ["CODEX_HOME"])
+assert stat.S_IMODE(home.stat().st_mode) == 0o700
+assert stat.S_IMODE((home / "auth.json").stat().st_mode) == 0o600
+assert 'cli_auth_credentials_store = "file"' in (home / "config.toml").read_text()
+print("MARKER", flush=True)
+print(home)
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&stub, fs::Permissions::from_mode(0o700)).unwrap();
+    let output = cli(&dir, &["t3-codex", "app-server"])
+        .env("CX_CODEX_BIN", stub)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("-> b (b@example.test)"));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines: Vec<_> = stdout.lines().collect();
+    assert_eq!(lines[0], "MARKER");
+    assert_ne!(std::path::Path::new(lines[1]), paths.codex_home);
+    assert!(!std::path::Path::new(lines[1]).exists());
+    assert_eq!(fs::read(&auth_path).unwrap(), before);
+    assert_eq!(
+        fs::metadata(auth_path).unwrap().modified().unwrap(),
+        modified
+    );
+    assert_eq!(cx::sessions::Registry::new(&paths).list().unwrap().len(), 1);
+}

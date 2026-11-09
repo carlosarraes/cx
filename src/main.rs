@@ -26,6 +26,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Pass exact arguments to Codex after account routing
+    T3Codex {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<OsString>,
+    },
+    /// Name the automatically routed account without launching
+    Pick,
     /// Launch Codex on an automatically selected account; put Codex arguments after --
     Run {
         /// Pin to an alias or unique email; never fall back
@@ -98,7 +105,14 @@ enum Commands {
 }
 
 fn main() {
-    match execute(Cli::parse()) {
+    let mut args: Vec<OsString> = std::env::args_os().collect();
+    if std::path::Path::new(&args[0])
+        .file_name()
+        .is_some_and(|n| n == "cx-t3-codex")
+    {
+        args.insert(1, "t3-codex".into());
+    }
+    match execute(Cli::parse_from(args)) {
         Ok(code) => std::process::exit(code),
         Err(error) => {
             eprintln!("error: {error:#}");
@@ -122,6 +136,8 @@ fn execute(cli: Cli) -> Result<i32> {
         return runtime::run(paths, runtime::codex_binary(), cli.codex_args);
     };
     match command {
+        Commands::T3Codex { args } => return cx::passthrough::run(paths, args),
+        Commands::Pick => return cx::passthrough::pick(&paths),
         Commands::Run {
             account,
             label,

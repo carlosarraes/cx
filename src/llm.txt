@@ -63,3 +63,5 @@ Credentials: $XDG_DATA_HOME/cx/state.json. Never print/copy its contents into me
 Registry: $XDG_DATA_HOME/cx/sessions.json; excludes tokens. CODEX_HOME is honored.
 CX_CODEX_BIN selects the Codex executable. Update Codex if app-server protocol fails.
 Never compile cs/cx on mac. just sync mac builds on mact and installs on mac.
+
+`cx t3-codex` and the `cx-t3-codex` symlink pass t3 arguments and stdio through to Codex after account routing. `cx pick` names the routed account without launching Codex.
