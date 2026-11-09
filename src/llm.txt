@@ -76,5 +76,15 @@ Newer matching overlay credentials sync before the next launch; only the saved
 refresh token is retained. Shared CODEX_HOME/auth.json is never changed by this path.
 CODEX_HOME supports ~ expansion. `cx pick` names the routed account without launching Codex.
 
-Borrow owner-routed credentials with `--borrow <host>` or `CX_BORROW` on run or pick.
-Both t3-codex entry points reject --borrow and any set CX_BORROW, including empty. CLI overrides the environment. The owner provides `cx lend` and idempotent `cx lend-release <lease_id>`. Only the access token crosses SSH; borrowed credentials stay in a private temporary overlay and never sync back.
+Borrow owner-routed credentials with `--borrow <host>` or `CX_BORROW` on run, pick, or t3-codex. CLI overrides the environment.
+Owner: `cx lend [--alias NAME] [--no-lease]` renews and hands out ONE account (access + id token, never the refresh token);
+`cx lend --inventory` lists usable aliases and quota with no tokens; `cx lend-release <lease_id>` is idempotent.
+Borrower: `cx borrow refresh --from HOST [--via JUMP]` (JUMP defaults to CX_BORROW_JUMP; nests `ssh JUMP ssh HOST ...`)
+caches every inventory alias that is missing or within 5 minutes of expiry at $XDG_DATA_HOME/cx/borrow/<host>.json (0600,
+no refresh token). Accounts added on the owner appear after the next refresh. Schedule it yourself; cx installs no timers.
+t3-codex with borrow set: warm cache => no SSH; pick the least-recently-used valid alias, write a stable overlay at
+$XDG_DATA_HOME/cx/borrow-overlays/<host>/<alias> (auth.json 0600: id/access token, refresh_token "", last_refresh now),
+and exec Codex at the same PID. Cold cache => one single-flight refresh (<=15s). Failure => warn and use the local route.
+Limit: the owner's refresh token never leaves the owner. Codex cannot refresh a borrowed token, so an app-server that
+outlives the access token will 401; the next spawn picks a fresh cached token. Keep `cx borrow refresh` running.
+`cx run --borrow` / `cx pick --borrow` lend live and keep a supervised temporary overlay; lend-release runs on exit.

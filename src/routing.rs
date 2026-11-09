@@ -107,6 +107,53 @@ pub fn select(
         })
         .map(|(a, _, _)| a.clone())
 }
+/// Offline pick: eligible cached quota first, else the least-used alias whose quota is unknown or stale.
+pub fn select_local(
+    s: &State,
+    counts: &BTreeMap<String, usize>,
+    now: i64,
+    cfg: &RoutingConfig,
+) -> Option<String> {
+    select(s, counts, now, cfg).or_else(|| {
+        s.accounts
+            .iter()
+            .filter(|(_, a)| a.usage.as_ref().is_none_or(|u| !fresh(u, now, cfg)))
+            .min_by_key(|(alias, _)| (counts.get(*alias).copied().unwrap_or(0), *alias))
+            .map(|(alias, _)| alias.clone())
+    })
+}
+
+/// Record a time-limited lease; it expires on its own, so no release is required.
+pub fn lease(registry: &Registry, identity: Identity, expires_at: i64) -> Result<String> {
+    static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let process = Process::current()?;
+    let id = format!(
+        "{}-{}-{}",
+        process.pid,
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
+        SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    registry.update(|s| {
+        s.runs.insert(
+            id.clone(),
+            ManagedSession {
+                expires_at: Some(expires_at),
+                id: id.clone(),
+                process,
+                account: identity,
+                mode: Mode::Interactive,
+                pinned: false,
+                label: None,
+                started_at: chrono::Utc::now().timestamp(),
+                threads: vec![],
+                pending: None,
+                error: None,
+            },
+        );
+        Ok(id.clone())
+    })
+}
+
 pub fn prepare(paths: &Paths, pin: Option<&str>) -> Result<(State, RoutingConfig, Option<String>)> {
     let cfg = RoutingConfig::load()?;
     let store = Store::new(paths.clone());

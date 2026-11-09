@@ -46,11 +46,7 @@ pub fn pick(paths: &Paths) -> Result<i32> {
 
 pub fn run(paths: Paths, args: Vec<OsString>) -> Result<i32> {
     let overlay = prepare_overlay(&paths)?;
-    let mut command = Command::new(runtime::codex_binary());
-    command
-        .args(args)
-        .env("CODEX_HOME", overlay.as_ref().unwrap_or(&paths.codex_home));
-    Err(command.exec()).context("cannot exec Codex")
+    exec_with_home(args, overlay.as_ref().unwrap_or(&paths.codex_home))
 }
 
 fn private_overlay_dir(path: &Path) -> Result<()> {
@@ -83,20 +79,7 @@ fn prepare_overlay(paths: &Paths) -> Result<Option<PathBuf>> {
     // Serialize reconciliation and overlay writes across simultaneous t3 probes.
     store.transaction(|state| {
         let now = chrono::Utc::now().timestamp();
-        let alias = routing::select(state, &counts, now, &cfg)
-            .or_else(|| {
-                state
-                    .accounts
-                    .iter()
-                    .filter(|(_, account)| {
-                        account
-                            .usage
-                            .as_ref()
-                            .is_none_or(|u| !routing::fresh(u, now, &cfg))
-                    })
-                    .min_by_key(|(alias, _)| (counts.get(*alias).copied().unwrap_or(0), *alias))
-                    .map(|(alias, _)| alias.clone())
-            })
+        let alias = routing::select_local(state, &counts, now, &cfg)
             .context("no saved account has locally eligible quota")?;
         let account = state
             .accounts
@@ -110,10 +93,7 @@ fn prepare_overlay(paths: &Paths) -> Result<Option<PathBuf>> {
             data: paths.data.clone(),
             codex_home: home.canonicalize()?,
         };
-        ensure!(
-            paths.codex_home.canonicalize().ok().as_ref() != Some(&overlay.codex_home),
-            "overlay directory must be separate from shared CODEX_HOME"
-        );
+        ensure_separate(paths, &overlay.codex_home)?;
         if let Ok(mut updated) = auth::import_current(&overlay) {
             if updated.email == account.email
                 && updated.account_id == account.account_id
@@ -125,50 +105,143 @@ fn prepare_overlay(paths: &Paths) -> Result<Option<PathBuf>> {
                 account.data = updated.data;
             }
         }
-        let config_path = paths.codex_home.join("config.toml");
-        let mut config = if config_path.exists() {
-            fs::read_to_string(config_path)?
-                .parse::<toml::Table>()
-                .map_err(|_| anyhow::anyhow!("Codex config is malformed"))?
-        } else {
-            toml::Table::new()
-        };
-        config.insert("cli_auth_credentials_store".into(), "file".into());
-        let mut temporary = tempfile::NamedTempFile::new_in(&overlay.codex_home)?;
-        temporary.write_all(toml::to_string(&config)?.as_bytes())?;
-        temporary.as_file().sync_all()?;
-        temporary
-            .persist(overlay.codex_home.join("config.toml"))
-            .map_err(|e| e.error)?;
-        if paths.codex_home.exists() {
-            for entry in fs::read_dir(paths.codex_home.canonicalize()?)? {
-                let entry = entry?;
-                if entry.file_name() == "auth.json" || entry.file_name() == "config.toml" {
-                    continue;
-                }
-                let target = overlay.codex_home.join(entry.file_name());
-                match fs::read_link(&target) {
-                    Ok(source) if source == entry.path() => continue,
-                    Ok(_) => fs::remove_file(&target)?,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
-                        anyhow::bail!(
-                            "overlay has local data at {}; reconcile it with {} before launching",
-                            target.display(),
-                            entry.path().display()
-                        );
-                    }
-                    Err(e) => return Err(e.into()),
-                }
-                std::os::unix::fs::symlink(entry.path(), target)?;
-            }
-        }
+        write_overlay_config(&paths.codex_home, &overlay.codex_home)?;
+        link_shared_entries(&paths.codex_home, &overlay.codex_home)?;
         auth::activate(&overlay, account)?;
         eprintln!("cx: t3-codex -> {} ({})", alias, account.email);
         Ok(Some(overlay.codex_home))
     })
 }
 
+pub fn exec_with_home(args: Vec<OsString>, home: &Path) -> Result<i32> {
+    let mut command = Command::new(runtime::codex_binary());
+    command.args(args).env("CODEX_HOME", home);
+    Err(command.exec()).context("cannot exec Codex")
+}
+
+fn write_overlay_config(shared: &Path, overlay: &Path) -> Result<()> {
+    let config_path = shared.join("config.toml");
+    let mut config = if config_path.exists() {
+        fs::read_to_string(config_path)?
+            .parse::<toml::Table>()
+            .map_err(|_| anyhow::anyhow!("Codex config is malformed"))?
+    } else {
+        toml::Table::new()
+    };
+    config.insert("cli_auth_credentials_store".into(), "file".into());
+    let mut temporary = tempfile::NamedTempFile::new_in(overlay)?;
+    temporary.write_all(toml::to_string(&config)?.as_bytes())?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist(overlay.join("config.toml"))
+        .map_err(|e| e.error)?;
+    Ok(())
+}
+
+fn link_shared_entries(shared: &Path, overlay: &Path) -> Result<()> {
+    if !shared.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(shared.canonicalize()?)? {
+        let entry = entry?;
+        if entry.file_name() == "auth.json" || entry.file_name() == "config.toml" {
+            continue;
+        }
+        let target = overlay.join(entry.file_name());
+        match fs::read_link(&target) {
+            Ok(source) if source == entry.path() => continue,
+            Ok(_) => fs::remove_file(&target)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
+                anyhow::bail!(
+                    "overlay has local data at {}; reconcile it with {} before launching",
+                    target.display(),
+                    entry.path().display()
+                );
+            }
+            Err(e) => return Err(e.into()),
+        }
+        std::os::unix::fs::symlink(entry.path(), target)?;
+    }
+    Ok(())
+}
+
+/// Short-lived tokens handed out by an owner. The owner's refresh token never
+/// reaches this host, so Codex gets an empty one purely so auth.json parses.
+pub struct BorrowedTokens<'a> {
+    pub id_token: &'a str,
+    pub access_token: &'a str,
+    pub account_id: &'a str,
+}
+
+/// Codex requires id_token, access_token and refresh_token to deserialize and
+/// last_refresh to treat the tokens as available. It will attempt a refresh
+/// near expiry, fail on the empty refresh token, and a long-lived app-server
+/// can then 401; `cx borrow refresh` keeps the cache warm for the next spawn.
+pub fn borrowed_auth_json(
+    tokens: &BorrowedTokens,
+    now: chrono::DateTime<chrono::Utc>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "auth_mode": "chatgpt",
+        "tokens": {
+            "id_token": tokens.id_token,
+            "access_token": tokens.access_token,
+            "refresh_token": "",
+            "account_id": tokens.account_id,
+        },
+        "last_refresh": now.to_rfc3339(),
+    })
+}
+
+fn write_borrowed_auth(overlay: &Path, tokens: &BorrowedTokens) -> Result<()> {
+    let mut temporary = tempfile::NamedTempFile::new_in(overlay)?;
+    temporary.write_all(&serde_json::to_vec_pretty(&borrowed_auth_json(
+        tokens,
+        chrono::Utc::now(),
+    ))?)?;
+    temporary.write_all(b"\n")?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .as_file()
+        .set_permissions(fs::Permissions::from_mode(0o600))?;
+    temporary
+        .persist(overlay.join("auth.json"))
+        .map_err(|e| e.error)?;
+    Ok(())
+}
+
+fn ensure_separate(paths: &Paths, overlay: &Path) -> Result<()> {
+    ensure!(
+        paths.codex_home.canonicalize().ok().as_deref() != Some(overlay),
+        "overlay directory must be separate from shared CODEX_HOME"
+    );
+    Ok(())
+}
+
+/// Stable per-host, per-alias overlay so exec'd Codex keeps a home that outlives this process.
+pub fn prepare_borrow_overlay(
+    paths: &Paths,
+    host: &str,
+    alias: &str,
+    tokens: &BorrowedTokens,
+) -> Result<PathBuf> {
+    fs::create_dir_all(&paths.data)?;
+    let mut home = paths.data.join("borrow-overlays");
+    private_overlay_dir(&home)?;
+    for part in [host, alias] {
+        home = home.join(part);
+        private_overlay_dir(&home)?;
+    }
+    let home = home.canonicalize()?;
+    ensure_separate(paths, &home)?;
+    write_overlay_config(&paths.codex_home, &home)?;
+    link_shared_entries(&paths.codex_home, &home)?;
+    write_borrowed_auth(&home, tokens)?;
+    Ok(home)
+}
+
+/// Interactive borrow only: Codex is supervised here and the overlay dies with it.
 pub fn run_overlay(
     paths: Paths,
     args: Vec<OsString>,
@@ -176,33 +249,12 @@ pub fn run_overlay(
 ) -> Result<i32> {
     let mut overlay = None;
     if let Some(grant) = borrowed {
-        use std::os::unix::fs::PermissionsExt;
         let home = tempfile::tempdir()?;
         fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700))?;
-        let config_path = paths.codex_home.join("config.toml");
-        let mut config = if config_path.exists() {
-            fs::read_to_string(config_path)?.parse::<toml::Table>()?
-        } else {
-            toml::Table::new()
-        };
-        config.insert("cli_auth_credentials_store".into(), "file".into());
-        fs::write(home.path().join("config.toml"), toml::to_string(&config)?)?;
-        if paths.codex_home.exists() {
-            for entry in fs::read_dir(&paths.codex_home)? {
-                let entry = entry?;
-                if entry.file_name() != "auth.json" && entry.file_name() != "config.toml" {
-                    std::os::unix::fs::symlink(entry.path(), home.path().join(entry.file_name()))?;
-                }
-            }
-        }
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(home.path().join("auth.json"))?;
-        file.write_all(serde_json::to_string(&serde_json::json!({"auth_mode":"chatgpt","tokens":{"access_token":grant.access_token,"account_id":grant.account_id}}))?.as_bytes())?;
+        ensure_separate(&paths, &home.path().canonicalize()?)?;
+        write_overlay_config(&paths.codex_home, home.path())?;
+        link_shared_entries(&paths.codex_home, home.path())?;
+        write_borrowed_auth(home.path(), &grant.tokens()?)?;
         overlay = Some(home);
     }
     let result = tokio::runtime::Runtime::new()?.block_on(async {

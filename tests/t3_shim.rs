@@ -134,45 +134,6 @@ fn expired_credentials_and_missing_usage_still_exec_locally_into_a_stable_overla
 }
 
 #[test]
-fn t3_rejects_borrow_before_ssh_even_when_the_environment_is_empty() {
-    let dir = TempDir::new().unwrap();
-    let ssh = dir.path().join("ssh");
-    fs::write(&ssh, "#!/bin/sh\ntouch \"$RECORD\"\nexit 1\n").unwrap();
-    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
-    let alias = dir.path().join("cx-t3-codex");
-    symlink(env!("CARGO_BIN_EXE_cx"), &alias).unwrap();
-    for aliased in [false, true] {
-        for (args, borrow) in [
-            (vec!["app-server", "--borrow", "owner"], None),
-            (vec!["app-server", "--borrow=owner"], None),
-            (vec!["--borrow=owner", "app-server"], None),
-            (vec!["app-server"], Some("owner")),
-            (vec!["app-server"], Some("")),
-            (vec!["--help"], Some("")),
-        ] {
-            let mut cmd = command(&dir);
-            if aliased {
-                cmd = isolated_command(&dir, &alias);
-            }
-            if let Some(value) = borrow {
-                cmd.env("CX_BORROW", value);
-            }
-            let output = cmd
-                .args(args)
-                .env("CX_CODEX_BIN", stub(&dir))
-                .env("CX_SSH", &ssh)
-                .env("RECORD", dir.path().join("ssh-called"))
-                .output()
-                .unwrap();
-            assert!(!output.status.success());
-            assert!(String::from_utf8_lossy(&output.stderr)
-                .contains("borrow is not supported by t3-codex"));
-            assert!(!dir.path().join("ssh-called").exists());
-        }
-    }
-}
-
-#[test]
 fn t3_expands_literal_tilde_in_codex_home_even_without_saved_accounts() {
     let dir = TempDir::new().unwrap();
     let output = command(&dir)

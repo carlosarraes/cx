@@ -235,4 +235,18 @@ SHA-256 checksums on GitHub.
 
 `cx t3-codex` and the `cx-t3-codex` symlink pass t3 arguments and stdio through to Codex after account routing. `cx pick` names the routed account without launching Codex.
 
-Borrow owner-routed credentials with `--borrow <host>` or `CX_BORROW` on run, t3-codex, or pick. CLI overrides the environment. The owner provides `cx lend` and idempotent `cx lend-release <lease_id>`. Only the access token crosses SSH; borrowed credentials stay in a private temporary overlay and never sync back.
+### Borrowing accounts from another machine
+
+The owner (the machine with the real logins) hands out short-lived tokens; the borrower never stores a refresh token.
+
+```sh
+# on the borrower, reaching the owner directly or through a jump host
+cx borrow refresh --from mac --via mact   # or set CX_BORROW_JUMP=mact
+export CX_BORROW=mac                      # opt in for cx-t3-codex, run, and pick
+```
+
+`cx borrow refresh` asks the owner for `cx lend --inventory`, then `cx lend --alias X` for every alias that is missing or near expiry. The owner renews only the account it lends. A newly added owner account shows up after the next refresh. cx installs no cron job or timer; schedule the refresh yourself.
+
+With `CX_BORROW` set, `cx-t3-codex` never uses SSH while the cache holds a valid token: it rotates across cached accounts, writes a stable overlay with a complete `auth.json` (empty `refresh_token`), and execs Codex at the same PID. An empty or stale cache triggers one bounded refresh; if that fails, it falls back to local routing. Codex cannot refresh a borrowed token, so an app-server that outlives its access token needs a restart to pick up a fresh one.
+
+`cx run --borrow <host>` and `cx pick --borrow <host>` lend live (`cx lend`, `cx lend-release <lease_id>`) and keep the credentials in a private temporary overlay that never syncs back.

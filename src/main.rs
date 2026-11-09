@@ -33,7 +33,23 @@ enum Commands {
     },
     /// Name the automatically routed account without launching
     Pick,
-    Lend,
+    /// Owner side of borrow: hand out one account's short-lived tokens as JSON
+    Lend {
+        /// Lend this alias instead of the automatically routed one
+        #[arg(long, conflicts_with = "inventory")]
+        alias: Option<String>,
+        /// List usable aliases and quota without any tokens
+        #[arg(long)]
+        inventory: bool,
+        /// Do not register a lease (used by `cx borrow refresh`)
+        #[arg(long)]
+        no_lease: bool,
+    },
+    /// Borrower side of borrow
+    Borrow {
+        #[command(subcommand)]
+        command: BorrowCommands,
+    },
     LendRelease {
         lease_id: String,
     },
@@ -112,6 +128,19 @@ enum Commands {
     },
 }
 
+#[derive(Subcommand)]
+enum BorrowCommands {
+    /// Cache short-lived tokens for every usable account on the owner
+    Refresh {
+        /// SSH host alias of the owner (e.g. mac)
+        #[arg(long)]
+        from: String,
+        /// Reach the owner through this SSH host (default: CX_BORROW_JUMP)
+        #[arg(long)]
+        via: Option<String>,
+    },
+}
+
 fn main() {
     let mut args: Vec<OsString> = std::env::args_os().collect();
     if std::path::Path::new(&args[0])
@@ -120,36 +149,30 @@ fn main() {
     {
         args.insert(1, "t3-codex".into());
     }
-    let borrow_requested = std::env::var_os("CX_BORROW").is_some()
-        || args.iter().any(|arg| {
-            arg == "--borrow" || arg.to_str().is_some_and(|s| s.starts_with("--borrow="))
-        });
-    let borrowed = cx::borrow::extract(&mut args);
-    let result = borrowed.and_then(|host| {
-        let t3 = args
-            .iter()
-            .skip(1)
-            .take_while(|arg| *arg != "--")
-            .find(|arg| !arg.as_encoded_bytes().starts_with(b"-"))
-            .is_some_and(|arg| arg == "t3-codex");
-        anyhow::ensure!(
-            !t3 || !borrow_requested,
-            "borrow is not supported by t3-codex; use cx run --borrow or cx pick --borrow"
-        );
+    let explicit = args
+        .iter()
+        .any(|arg| arg == "--borrow" || arg.to_str().is_some_and(|s| s.starts_with("--borrow=")));
+    let result = cx::borrow::extract(&mut args).and_then(|host| {
         let cli = Cli::parse_from(args);
-        if let Some(host) = host {
-            let paths = Paths::discover()?;
-            return match cli.command {
-                Some(Commands::Pick) => cx::borrow::pick(&host),
-                Some(Commands::Run { account, args, .. }) => {
-                    anyhow::ensure!(account.is_none(), "--borrow conflicts with --account");
-                    cx::borrow::run(paths, &host, args)
-                }
-                None => cx::borrow::run(paths, &host, cli.codex_args),
-                _ => anyhow::bail!("--borrow requires run or pick"),
-            };
+        let Some(host) = host.filter(|_| !cli.llm) else {
+            return execute(cli);
+        };
+        let paths = Paths::discover()?;
+        match cli.command {
+            Some(Commands::T3Codex { args }) => cx::borrower::t3(paths, &host, args),
+            Some(Commands::Pick) => cx::borrow::pick(&host),
+            Some(Commands::Run { account, args, .. }) => {
+                anyhow::ensure!(account.is_none(), "--borrow conflicts with --account");
+                cx::borrow::run(paths, &host, args)
+            }
+            None => cx::borrow::run(paths, &host, cli.codex_args),
+            // CX_BORROW in the environment must not break owner-side or unrelated commands.
+            Some(
+                Commands::Lend { .. } | Commands::LendRelease { .. } | Commands::Borrow { .. },
+            ) => execute(cli),
+            Some(_) if !explicit => execute(cli),
+            Some(_) => anyhow::bail!("--borrow requires run or pick"),
         }
-        execute(cli)
     });
     match result {
         Ok(code) => std::process::exit(code),
@@ -175,7 +198,26 @@ fn execute(cli: Cli) -> Result<i32> {
         return runtime::run(paths, runtime::codex_binary(), cli.codex_args);
     };
     match command {
-        Commands::Lend => return cx::borrow::lend(&paths),
+        Commands::Lend {
+            alias,
+            inventory,
+            no_lease,
+        } => {
+            return cx::borrow::lend(
+                &paths,
+                cx::borrow::LendOptions {
+                    alias,
+                    inventory,
+                    no_lease,
+                },
+            )
+        }
+        Commands::Borrow {
+            command: BorrowCommands::Refresh { from, via },
+        } => {
+            let via = via.or_else(cx::borrow::jump_from_env);
+            return cx::borrower::refresh(&paths, &from, via.as_deref());
+        }
         Commands::LendRelease { lease_id } => {
             cx::borrow::release(&paths, &lease_id)?;
             return Ok(0);
