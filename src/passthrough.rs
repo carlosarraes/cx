@@ -1,10 +1,23 @@
 use crate::{
-    auth, routing, runtime,
+    auth,
+    config::RoutingConfig,
+    routing, runtime,
     sessions::{Mode, Reservation},
     state::{Paths, Store},
 };
 use anyhow::{ensure, Context, Result};
-use std::{ffi::OsString, fs, os::unix::process::ExitStatusExt, process::Stdio};
+use std::{
+    collections::BTreeMap,
+    ffi::OsString,
+    fs,
+    io::Write,
+    os::unix::{
+        fs::{DirBuilderExt, PermissionsExt},
+        process::{CommandExt, ExitStatusExt},
+    },
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+};
 use tokio::signal::unix::{signal, SignalKind};
 
 fn reserve(paths: &Paths) -> Result<Option<Reservation>> {
@@ -32,7 +45,128 @@ pub fn pick(paths: &Paths) -> Result<i32> {
 }
 
 pub fn run(paths: Paths, args: Vec<OsString>) -> Result<i32> {
-    run_overlay(paths, args, None)
+    let overlay = prepare_overlay(&paths)?;
+    let mut command = Command::new(runtime::codex_binary());
+    command
+        .args(args)
+        .env("CODEX_HOME", overlay.as_ref().unwrap_or(&paths.codex_home));
+    Err(command.exec()).context("cannot exec Codex")
+}
+
+fn private_overlay_dir(path: &Path) -> Result<()> {
+    match fs::DirBuilder::new().mode(0o700).create(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            ensure!(
+                fs::symlink_metadata(path)?.file_type().is_dir(),
+                "overlay path must be a directory, not a symlink: {}",
+                path.display()
+            );
+        }
+        Err(error) => return Err(error.into()),
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+fn prepare_overlay(paths: &Paths) -> Result<Option<PathBuf>> {
+    let store = Store::new(paths.clone());
+    if store.read()?.accounts.is_empty() {
+        eprintln!("cx: no saved accounts; routing fallback to current login");
+        return Ok(None);
+    }
+    let cfg = RoutingConfig::load()?;
+    let mut counts = BTreeMap::new();
+    for session in crate::sessions::Registry::new(paths).list()? {
+        *counts.entry(session.account.alias).or_insert(0) += 1;
+    }
+    // Serialize reconciliation and overlay writes across simultaneous t3 probes.
+    store.transaction(|state| {
+        let now = chrono::Utc::now().timestamp();
+        let alias = routing::select(state, &counts, now, &cfg)
+            .or_else(|| {
+                state
+                    .accounts
+                    .iter()
+                    .filter(|(_, account)| {
+                        account
+                            .usage
+                            .as_ref()
+                            .is_none_or(|u| !routing::fresh(u, now, &cfg))
+                    })
+                    .min_by_key(|(alias, _)| (counts.get(*alias).copied().unwrap_or(0), *alias))
+                    .map(|(alias, _)| alias.clone())
+            })
+            .context("no saved account has locally eligible quota")?;
+        let account = state
+            .accounts
+            .get_mut(&alias)
+            .context("selected account disappeared")?;
+        let root = paths.data.join("t3-overlays");
+        private_overlay_dir(&root)?;
+        let home = root.join(&alias);
+        private_overlay_dir(&home)?;
+        let overlay = Paths {
+            data: paths.data.clone(),
+            codex_home: home.canonicalize()?,
+        };
+        ensure!(
+            paths.codex_home.canonicalize().ok().as_ref() != Some(&overlay.codex_home),
+            "overlay directory must be separate from shared CODEX_HOME"
+        );
+        if let Ok(mut updated) = auth::import_current(&overlay) {
+            if updated.email == account.email
+                && updated.account_id == account.account_id
+                && auth::refresh_time(&updated.data) > auth::refresh_time(&account.data)
+            {
+                // Only reuse refresh tokens already held in the saved account.
+                updated.data["tokens"]["refresh_token"] =
+                    account.data["tokens"]["refresh_token"].clone();
+                account.data = updated.data;
+            }
+        }
+        let config_path = paths.codex_home.join("config.toml");
+        let mut config = if config_path.exists() {
+            fs::read_to_string(config_path)?
+                .parse::<toml::Table>()
+                .map_err(|_| anyhow::anyhow!("Codex config is malformed"))?
+        } else {
+            toml::Table::new()
+        };
+        config.insert("cli_auth_credentials_store".into(), "file".into());
+        let mut temporary = tempfile::NamedTempFile::new_in(&overlay.codex_home)?;
+        temporary.write_all(toml::to_string(&config)?.as_bytes())?;
+        temporary.as_file().sync_all()?;
+        temporary
+            .persist(overlay.codex_home.join("config.toml"))
+            .map_err(|e| e.error)?;
+        if paths.codex_home.exists() {
+            for entry in fs::read_dir(paths.codex_home.canonicalize()?)? {
+                let entry = entry?;
+                if entry.file_name() == "auth.json" || entry.file_name() == "config.toml" {
+                    continue;
+                }
+                let target = overlay.codex_home.join(entry.file_name());
+                match fs::read_link(&target) {
+                    Ok(source) if source == entry.path() => continue,
+                    Ok(_) => fs::remove_file(&target)?,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
+                        anyhow::bail!(
+                            "overlay has local data at {}; reconcile it with {} before launching",
+                            target.display(),
+                            entry.path().display()
+                        );
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+                std::os::unix::fs::symlink(entry.path(), target)?;
+            }
+        }
+        auth::activate(&overlay, account)?;
+        eprintln!("cx: t3-codex -> {} ({})", alias, account.email);
+        Ok(Some(overlay.codex_home))
+    })
 }
 
 pub fn run_overlay(
@@ -40,43 +174,7 @@ pub fn run_overlay(
     args: Vec<OsString>,
     borrowed: Option<&crate::borrow::Grant>,
 ) -> Result<i32> {
-    let reservation = if borrowed.is_some() {
-        None
-    } else {
-        reserve(&paths)?
-    };
     let mut overlay = None;
-    if let Some(reservation) = &reservation {
-        let identity = reservation.get()?.account;
-        let account = auth::credentials(&Store::new(paths.clone()), &identity.alias, false)?;
-        let home = tempfile::tempdir()?;
-        let config_path = paths.codex_home.join("config.toml");
-        let mut config = if config_path.exists() {
-            fs::read_to_string(config_path)?.parse::<toml::Table>()?
-        } else {
-            toml::Table::new()
-        };
-        config.insert("cli_auth_credentials_store".into(), "file".into());
-        fs::write(home.path().join("config.toml"), toml::to_string(&config)?)?;
-        if paths.codex_home.exists() {
-            for entry in fs::read_dir(&paths.codex_home)? {
-                let entry = entry?;
-                if entry.file_name() == "auth.json" || entry.file_name() == "config.toml" {
-                    continue;
-                }
-                std::os::unix::fs::symlink(entry.path(), home.path().join(entry.file_name()))?;
-            }
-        }
-        auth::activate(
-            &Paths {
-                data: paths.data.clone(),
-                codex_home: home.path().into(),
-            },
-            &account,
-        )?;
-        eprintln!("cx: t3-codex -> {} ({})", identity.alias, identity.email);
-        overlay = Some(home);
-    }
     if let Some(grant) = borrowed {
         use std::os::unix::fs::PermissionsExt;
         let home = tempfile::tempdir()?;
@@ -138,29 +236,6 @@ pub fn run_overlay(
             .code()
             .unwrap_or_else(|| 128 + status.signal().unwrap_or(1)))
     });
-    if let (Some(home), Some(reservation)) = (&overlay, &reservation) {
-        if home.path().join("auth.json").exists() {
-            let identity = reservation.get()?.account;
-            let updated = auth::import_current(&Paths {
-                data: paths.data.clone(),
-                codex_home: home.path().into(),
-            })
-            .map_err(|_| anyhow::anyhow!("cannot read updated overlay credentials"))?;
-            ensure!(
-                identity.matches(&updated),
-                "overlay account identity changed"
-            );
-            Store::new(paths.clone()).transaction(|state| {
-                let saved = state
-                    .accounts
-                    .get_mut(&identity.alias)
-                    .context("selected account disappeared before credential sync")?;
-                ensure!(identity.matches(saved), "saved account identity changed");
-                saved.data = updated.data;
-                Ok(())
-            })?;
-        }
-    }
     if let Some(grant) = borrowed {
         grant.release_remote();
     }

@@ -195,7 +195,7 @@ fn publish_latest_if_matching(
     })
 }
 
-fn refresh_time(data: &Value) -> Option<chrono::DateTime<Utc>> {
+pub(crate) fn refresh_time(data: &Value) -> Option<chrono::DateTime<Utc>> {
     data.get("last_refresh")
         .and_then(Value::as_str)
         .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())

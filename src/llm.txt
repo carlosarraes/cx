@@ -64,6 +64,17 @@ Registry: $XDG_DATA_HOME/cx/sessions.json; excludes tokens. CODEX_HOME is honore
 CX_CODEX_BIN selects the Codex executable. Update Codex if app-server protocol fails.
 Never compile cs/cx on mac. just sync mac builds on mact and installs on mac.
 
-`cx t3-codex` and the `cx-t3-codex` symlink pass t3 arguments and stdio through to Codex after account routing. `cx pick` names the routed account without launching Codex.
+`cx t3-codex` and the `cx-t3-codex` symlink select locally and exec Codex with the
+original arguments and stdio. The tracked PID becomes Codex. No network, SSH, token
+refresh, or session registration occurs before exec. Fresh cached quota and live
+counts guide selection; missing/stale quota falls back to the least-used saved alias.
+Fresh exhausted accounts are excluded. With no saved accounts, use the current login.
+Stable private overlays live at $XDG_DATA_HOME/cx/t3-overlays/<alias> and are reused.
+Symlinked overlay directories are rejected. Conflicting local overlay entries fail
+without deleting data; reconcile them with the real CODEX_HOME before retrying.
+Newer matching overlay credentials sync before the next launch; only the saved
+refresh token is retained. Shared CODEX_HOME/auth.json is never changed by this path.
+CODEX_HOME supports ~ expansion. `cx pick` names the routed account without launching Codex.
 
-Borrow owner-routed credentials with `--borrow <host>` or `CX_BORROW` on run, t3-codex, or pick. CLI overrides the environment. The owner provides `cx lend` and idempotent `cx lend-release <lease_id>`. Only the access token crosses SSH; borrowed credentials stay in a private temporary overlay and never sync back.
+Borrow owner-routed credentials with `--borrow <host>` or `CX_BORROW` on run or pick.
+Both t3-codex entry points reject --borrow and any set CX_BORROW, including empty. CLI overrides the environment. The owner provides `cx lend` and idempotent `cx lend-release <lease_id>`. Only the access token crosses SSH; borrowed credentials stay in a private temporary overlay and never sync back.

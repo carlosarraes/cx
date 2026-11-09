@@ -412,7 +412,7 @@ fn passthrough_fallback_preserves_arguments_stdio_and_alias_dispatch() {
 }
 
 #[test]
-fn routed_passthrough_isolates_credentials_and_matches_pick() {
+fn routed_passthrough_reuses_overlay_and_syncs_newer_credentials_before_exec() {
     use std::os::unix::fs::PermissionsExt;
     let dir = TempDir::new().unwrap();
     for alias in ["a", "b"] {
@@ -455,10 +455,11 @@ assert stat.S_IMODE(home.stat().st_mode) == 0o700
 assert stat.S_IMODE((home / "auth.json").stat().st_mode) == 0o600
 assert 'cli_auth_credentials_store = "file"' in (home / "config.toml").read_text()
 print("MARKER", flush=True)
-print(home)
+print(home, flush=True)
 auth_path = home / "auth.json"
 blob = json.loads(auth_path.read_text())
-blob["tokens"]["refresh_token"] = os.environ.get("FAKE_ROTATED_TOKEN", "fake-rotated-refresh-token")
+blob["tokens"]["access_token"] = "updated-access"
+blob["last_refresh"] = "2099-01-01T00:00:00Z"
 auth_path.write_text(json.dumps(blob))
 if os.environ.get("FAKE_EXIT") == "signal":
     os.kill(os.getpid(), signal.SIGTERM)
@@ -481,33 +482,33 @@ raise SystemExit(int(os.environ.get("FAKE_EXIT", "0")))
     let lines: Vec<_> = stdout.lines().collect();
     assert_eq!(lines[0], "MARKER");
     assert_ne!(std::path::Path::new(lines[1]), paths.codex_home);
-    assert!(!std::path::Path::new(lines[1]).exists());
+    let overlay = std::path::PathBuf::from(lines[1]);
+    assert!(overlay.exists());
     assert_eq!(fs::read(&auth_path).unwrap(), before);
     assert_eq!(
         fs::metadata(&auth_path).unwrap().modified().unwrap(),
         modified
     );
     let saved = cx::state::Store::new(paths.clone()).read().unwrap();
-    assert!(saved.accounts["b"].data["tokens"]["refresh_token"]
-        .as_str()
-        .is_some_and(|token| token == "fake-rotated-refresh-token"));
+    assert!(saved.accounts["b"].data["tokens"]["access_token"] != "updated-access");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(!stderr.contains("fake-rotated-refresh-token"));
+    assert!(!stderr.contains("updated-access"));
     assert!(!stderr.contains("secret-refresh"));
-    for (exit, code) in [("7", 7), ("signal", 143)] {
-        let token = format!("fake-rotated-token-{exit}");
+    for (exit, code) in [("7", Some(7)), ("signal", None)] {
         let output = cli(&dir, &["t3-codex", "app-server"])
             .env("CX_CODEX_BIN", &stub)
-            .env("FAKE_ROTATED_TOKEN", &token)
             .env("FAKE_EXIT", exit)
             .output()
             .unwrap();
-        assert_eq!(output.status.code(), Some(code));
+        assert_eq!(output.status.code(), code);
+        if code.is_none() {
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(output.status.signal(), Some(libc::SIGTERM));
+        }
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(stdout.lines().nth(1), overlay.to_str());
         let saved = cx::state::Store::new(paths.clone()).read().unwrap();
-        assert!(saved.accounts["b"].data["tokens"]["refresh_token"]
-            .as_str()
-            .is_some_and(|value| value == token));
-        assert!(!String::from_utf8_lossy(&output.stderr).contains(&token));
+        assert!(saved.accounts["b"].data["tokens"]["access_token"] == "updated-access");
         assert_eq!(fs::read(&auth_path).unwrap(), before);
     }
     assert_eq!(cx::sessions::Registry::new(&paths).list().unwrap().len(), 1);
@@ -556,7 +557,7 @@ sys.exit(code)
         }
         let record = dir.path().join("record");
         let overlay = dir.path().join("overlay");
-        let out = cli(&dir, &["t3-codex", "app-server", "--borrow=owner"])
+        let out = cli(&dir, &["run", "--borrow=owner", "--", "app-server"])
             .env("CX_SSH", ssh)
             .env("CX_CODEX_BIN", codex)
             .env("RECORD", &record)

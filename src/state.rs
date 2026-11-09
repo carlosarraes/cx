@@ -24,7 +24,14 @@ impl Paths {
             .unwrap_or_else(|| home.join(".local/share"))
             .join("cx");
         let codex_home = env::var_os("CODEX_HOME")
-            .map(PathBuf::from)
+            .map(|value| {
+                let path = PathBuf::from(value);
+                if let Ok(suffix) = path.strip_prefix("~") {
+                    home.join(suffix)
+                } else {
+                    path
+                }
+            })
             .unwrap_or_else(|| home.join(".codex"));
         Ok(Self { data, codex_home })
     }

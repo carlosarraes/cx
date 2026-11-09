@@ -120,20 +120,33 @@ fn main() {
     {
         args.insert(1, "t3-codex".into());
     }
+    let borrow_requested = std::env::var_os("CX_BORROW").is_some()
+        || args.iter().any(|arg| {
+            arg == "--borrow" || arg.to_str().is_some_and(|s| s.starts_with("--borrow="))
+        });
     let borrowed = cx::borrow::extract(&mut args);
     let result = borrowed.and_then(|host| {
+        let t3 = args
+            .iter()
+            .skip(1)
+            .take_while(|arg| *arg != "--")
+            .find(|arg| !arg.as_encoded_bytes().starts_with(b"-"))
+            .is_some_and(|arg| arg == "t3-codex");
+        anyhow::ensure!(
+            !t3 || !borrow_requested,
+            "borrow is not supported by t3-codex; use cx run --borrow or cx pick --borrow"
+        );
         let cli = Cli::parse_from(args);
         if let Some(host) = host {
             let paths = Paths::discover()?;
             return match cli.command {
                 Some(Commands::Pick) => cx::borrow::pick(&host),
-                Some(Commands::T3Codex { args }) => cx::borrow::run(paths, &host, args),
                 Some(Commands::Run { account, args, .. }) => {
                     anyhow::ensure!(account.is_none(), "--borrow conflicts with --account");
                     cx::borrow::run(paths, &host, args)
                 }
                 None => cx::borrow::run(paths, &host, cli.codex_args),
-                _ => anyhow::bail!("--borrow requires run, t3-codex, or pick"),
+                _ => anyhow::bail!("--borrow requires run or pick"),
             };
         }
         execute(cli)
