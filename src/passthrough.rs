@@ -21,13 +21,20 @@ use std::{
 use tokio::signal::unix::{signal, SignalKind};
 
 fn reserve(paths: &Paths) -> Result<Option<Reservation>> {
+    let pin = crate::borrow::pin_from_env();
     if Store::new(paths.clone()).read()?.accounts.is_empty() {
+        if let Some(pin) = pin {
+            anyhow::bail!("{pin}: unknown account; use cx list");
+        }
         eprintln!("cx: no saved accounts; routing fallback to current login");
         return Ok(None);
     }
     routing::reserve(
         paths,
-        &routing::RunOptions::default(),
+        &routing::RunOptions {
+            account: pin,
+            ..routing::RunOptions::default()
+        },
         None,
         Mode::Interactive,
     )
@@ -67,7 +74,11 @@ fn private_overlay_dir(path: &Path) -> Result<()> {
 
 fn prepare_overlay(paths: &Paths) -> Result<Option<PathBuf>> {
     let store = Store::new(paths.clone());
+    let pin = crate::borrow::pin_from_env();
     if store.read()?.accounts.is_empty() {
+        if let Some(pin) = pin {
+            anyhow::bail!("{pin}: unknown account; use cx list");
+        }
         eprintln!("cx: no saved accounts; routing fallback to current login");
         return Ok(None);
     }
@@ -79,8 +90,12 @@ fn prepare_overlay(paths: &Paths) -> Result<Option<PathBuf>> {
     // Serialize reconciliation and overlay writes across simultaneous t3 probes.
     store.transaction(|state| {
         let now = chrono::Utc::now().timestamp();
-        let alias = routing::select_local(state, &counts, now, &cfg)
-            .context("no saved account has locally eligible quota")?;
+        let alias = if let Some(pin) = pin.as_deref() {
+            routing::resolve(state, pin)?
+        } else {
+            routing::select_local(state, &counts, now, &cfg)
+                .context("no saved account has locally eligible quota")?
+        };
         let account = state
             .accounts
             .get_mut(&alias)

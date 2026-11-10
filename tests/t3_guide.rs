@@ -41,6 +41,14 @@ fn t3_guide_prints_live_instances_and_aliases_without_secrets() {
                     "config": {"binaryPath": "/secret-bin-path-should-not-appear"},
                     "environment": [{"name": "CX_BORROW", "value": "should-not-appear-env-value"}]
                 },
+                "codex-carlos2": {
+                    "driver": "codex",
+                    "enabled": true,
+                    "environment": [
+                        {"name": "CX_BORROW", "value": "should-not-appear-env-value"},
+                        {"name": "CX_PIN", "value": "pinned-one"}
+                    ]
+                },
                 "claudeAgent": {
                     "driver": "claudeAgent",
                     "enabled": false
@@ -79,6 +87,8 @@ fn t3_guide_prints_live_instances_and_aliases_without_secrets() {
     assert_eq!(code, 0, "{stderr}");
     assert!(stdout.contains("cx-t3-codex"), "{stdout}");
     assert!(stdout.contains("codex"), "{stdout}");
+    assert!(stdout.contains("codex-carlos2"), "{stdout}");
+    assert!(stdout.contains("pin=pinned-one"), "{stdout}");
     assert!(stdout.contains("claudeAgent"), "{stdout}");
     assert!(stdout.contains("disabled"), "{stdout}");
     assert!(stdout.contains("local-one"), "{stdout}");

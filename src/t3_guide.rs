@@ -14,6 +14,7 @@ struct Instance {
     id: String,
     driver: Option<String>,
     enabled: Option<bool>,
+    pin: Option<String>,
 }
 
 fn guide() -> String {
@@ -47,6 +48,10 @@ the cache with `cx borrow refresh --from <host>`. Spawns read that cache
 and do not SSH while a token is still valid. Codex cannot refresh a
 borrowed token, so an app-server that outlives the access token will 401
 until the next spawn.
+
+Pin an account with CX_PIN=<alias> (empty means off). With CX_BORROW set,
+the pin must name a cached borrowed alias. An unknown or expired pin fails
+without falling back to another account or the local login.
 
 ";
 
@@ -91,8 +96,27 @@ fn read_instances(path: &Path) -> Result<Vec<Instance>, String> {
                 .and_then(Value::as_str)
                 .map(str::to_owned),
             enabled: inst.get("enabled").and_then(Value::as_bool),
+            pin: env_value(inst, "CX_PIN"),
         })
         .collect())
+}
+
+fn env_value(inst: &Value, name: &str) -> Option<String> {
+    inst.get("environment")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find_map(|entry| {
+            if entry.get("name").and_then(Value::as_str) != Some(name) {
+                return None;
+            }
+            entry
+                .get("value")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        })
 }
 
 fn example_instance(
@@ -131,7 +155,15 @@ fn instances_section(path: &Path, instances: &Result<Vec<Instance>, String>) -> 
                     Some(false) => "disabled",
                     None => "enabled=?",
                 };
-                out.push_str(&format!("  {}  driver={}  {}\n", inst.id, driver, enabled));
+                match &inst.pin {
+                    Some(pin) => out.push_str(&format!(
+                        "  {}  driver={}  {}  pin={pin}\n",
+                        inst.id, driver, enabled
+                    )),
+                    None => {
+                        out.push_str(&format!("  {}  driver={}  {}\n", inst.id, driver, enabled))
+                    }
+                }
             }
             out.push('\n');
         }
@@ -155,6 +187,10 @@ Pass modelSelection.instanceId in t3_thread_launch. Example:
     projectId: \"<project-id>\"
     modelSelection: {{ instanceId: \"{example_id}\", model: \"<model>\" }}
     message: \"...\"
+
+A dedicated instance can pin one cx alias with CX_PIN=<alias> on that
+instance (listed as pin= above). Empty CX_PIN means off, so the default
+instance keeps auto-rotating.
 
 If instanceId is omitted, t3 inherits the caller's instance. If it does
 not match any provider instance on this machine, t3 rejects the launch

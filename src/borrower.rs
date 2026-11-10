@@ -158,11 +158,35 @@ fn choose(cache: &Cache, now: i64) -> Option<String> {
 /// Pick a valid cached grant, record its use, and write its stable overlay.
 /// Everything happens under the cache lock so concurrent probes agree on rotation
 /// and never race on the overlay's symlinks.
-fn pick_and_prepare(paths: &Paths, files: &Files, host: &str) -> Result<Option<PathBuf>> {
+fn check_pinned(cache: &Cache, pin: &str, now: i64) -> Result<()> {
+    let Some(entry) = cache.accounts.get(pin) else {
+        anyhow::bail!("{pin}: unknown pin; not in the borrow cache; no fallback");
+    };
+    if !usable(entry, now) {
+        anyhow::bail!("{pin}: pinned account is expired; no fallback");
+    }
+    if exhausted(entry, now) {
+        anyhow::bail!("{pin}: quota exhausted; no fallback");
+    }
+    Ok(())
+}
+
+fn pick_and_prepare(
+    paths: &Paths,
+    files: &Files,
+    host: &str,
+    pin: Option<&str>,
+) -> Result<Option<PathBuf>> {
     with_cache(files, |cache| {
         let now = chrono::Utc::now().timestamp();
-        let Some(alias) = choose(cache, now) else {
-            return Ok((None, false));
+        let alias = if let Some(pin) = pin {
+            check_pinned(cache, pin, now)?;
+            pin.to_string()
+        } else {
+            let Some(alias) = choose(cache, now) else {
+                return Ok((None, false));
+            };
+            alias
         };
         let entry = cache.accounts.get_mut(&alias).context("alias vanished")?;
         let home = passthrough::prepare_borrow_overlay(
@@ -317,8 +341,12 @@ fn note_failure(files: &Files) {
 /// Warm cache: no network. Cold cache: one bounded, single-flight refresh.
 fn prepare_t3(paths: &Paths, host: &str) -> Result<PathBuf> {
     let files = files(paths, host)?;
-    if let Some(home) = pick_and_prepare(paths, &files, host)? {
+    let pin = borrow::pin_from_env();
+    if let Some(home) = pick_and_prepare(paths, &files, host, pin.as_deref())? {
         return Ok(home);
+    }
+    if let Some(pin) = pin {
+        anyhow::bail!("{pin}: pinned account is not usable; no fallback");
     }
     let failed_at = with_cache(&files, |cache| Ok((cache.refresh_failed_at, false)))?;
     ensure!(
@@ -329,7 +357,7 @@ fn prepare_t3(paths: &Paths, host: &str) -> Result<PathBuf> {
     let guard = lock_until(&files.refresh_lock, deadline)?
         .context("timed out waiting for another borrow refresh")?;
     // A concurrent probe may have refreshed while this one waited.
-    if let Some(home) = pick_and_prepare(paths, &files, host)? {
+    if let Some(home) = pick_and_prepare(paths, &files, host, None)? {
         return Ok(home);
     }
     let via = borrow::jump_from_env();
@@ -338,14 +366,17 @@ fn prepare_t3(paths: &Paths, host: &str) -> Result<PathBuf> {
         return Err(error);
     }
     drop(guard);
-    pick_and_prepare(paths, &files, host)?.context("no borrowed credential is usable")
+    pick_and_prepare(paths, &files, host, None)?.context("no borrowed credential is usable")
 }
 
 /// t3 entry point: pick locally and replace this process with Codex. Any borrow
 /// problem degrades to the ordinary local route instead of failing the probe.
+/// A CX_PIN failure is fatal: it never falls back to another account.
 pub fn t3(paths: Paths, host: &str, args: Vec<OsString>) -> Result<i32> {
+    let pin = borrow::pin_from_env();
     match prepare_t3(&paths, host) {
         Ok(home) => passthrough::exec_with_home(args, &home),
+        Err(error) if pin.is_some() => Err(error),
         Err(error) => {
             eprintln!(
                 "cx: warning: borrow from {host} unavailable ({error:#}); using local routing"
@@ -392,5 +423,33 @@ mod tests {
         secret.access_token = "super-secret-access".into();
         cache.accounts.insert("a".into(), secret);
         assert!(!format!("{cache:?}").contains("super-secret"));
+    }
+
+    #[test]
+    fn pinned_account_is_accepted_even_when_it_is_not_least_recent() {
+        let now = 1_000_000;
+        let mut cache = Cache::default();
+        cache.accounts.insert("a".into(), entry(now + 3600, 20));
+        cache.accounts.insert("b".into(), entry(now + 3600, 10));
+        assert!(check_pinned(&cache, "a", now).is_ok());
+        let error = check_pinned(&cache, "missing", now)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("unknown pin") && error.contains("no fallback"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn pinned_expired_account_is_rejected() {
+        let now = 1_000_000;
+        let mut cache = Cache::default();
+        cache.accounts.insert("old".into(), entry(now + 60, 0));
+        let error = check_pinned(&cache, "old", now).unwrap_err().to_string();
+        assert!(
+            error.contains("expired") && error.contains("no fallback"),
+            "{error}"
+        );
     }
 }

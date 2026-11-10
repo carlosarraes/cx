@@ -99,7 +99,7 @@ else:
 ''')
     fake_ssh.chmod(0o700)
 
-    def run_phase(name, data, env, records, borrow):
+    def run_phase(name, data, env, records, borrow, pin=None):
         started = set()
         lock = threading.Lock()
 
@@ -220,7 +220,9 @@ else:
         print(f"[{name}] before:", json.dumps(before, sort_keys=True), flush=True)
         ssh_log = Path(env["STRESS_SSH_LOG"]) if borrow else None
         try:
-            if borrow:
+            if borrow and pin:
+                warm_calls = len(ssh_log.read_text().splitlines()) if ssh_log.exists() else 0
+            elif borrow:
                 cold_wave()
                 calls = ssh_log.read_text().splitlines()
                 if sum("--inventory" in c for c in calls) != 1 or len(calls) != 3:
@@ -250,9 +252,11 @@ else:
             else:
                 if len(ssh_log.read_text().splitlines()) != warm_calls:
                     raise AssertionError("SSH was used on the warm spawn path")
-                expected = {str(data / f"borrow-overlays/owner/owner-{x}") for x in "ab"}
+                expected = {str(data / f"borrow-overlays/owner/{pin}")} if pin else {str(data / f"borrow-overlays/owner/owner-{x}") for x in "ab"}
                 if homes != expected:
-                    raise AssertionError("borrowed spawns did not rotate across both stable overlays")
+                    raise AssertionError(
+                        f"{'pinned' if pin else 'borrowed'} spawns used {homes}, expected {expected}"
+                    )
                 if (data / "t3-overlays").exists():
                     raise AssertionError("borrow phase fell back to the local route")
                 for home in homes:
@@ -268,7 +272,9 @@ else:
                 cache = data / "borrow/owner.json"
                 if cache.stat().st_mode & 0o777 != 0o600 or "refresh_token" in cache.read_text():
                     raise AssertionError("borrow cache is not private or holds a refresh token")
-                print(f"PASS [{name}]: cold single-flight refresh ({warm_calls} ssh calls), then {args.cycles} cycles with 0 ssh calls, rotated across 2 overlays, pid-only teardown left 0 processes")
+                detail = f"pinned to {pin}" if pin else "rotated across 2 overlays"
+                prefix = f"{args.cycles} cycles with 0 ssh calls" if pin else f"cold single-flight refresh ({warm_calls} ssh calls), then {args.cycles} cycles with 0 ssh calls"
+                print(f"PASS [{name}]: {prefix}, {detail}, pid-only teardown left 0 processes")
         finally:
             # Only processes created by this harness are eligible for cleanup.
             for pid, status, command in owned_processes():
@@ -290,4 +296,8 @@ else:
     borrow_env = dict(base_env, XDG_DATA_HOME=str(root / "data-borrow"), STRESS_RECORDS=str(borrow_records),
                       CX_BORROW="owner", CX_SSH=str(fake_ssh), STRESS_SSH_LOG=str(root / "ssh.log"))
     run_phase("borrow", borrow_data, borrow_env, borrow_records, True)
+    pin_records = root / "records-pin"
+    pin_records.mkdir()
+    pin_env = dict(borrow_env, CX_PIN="owner-a", STRESS_RECORDS=str(pin_records))
+    run_phase("pin", borrow_data, pin_env, pin_records, True, pin="owner-a")
 PY

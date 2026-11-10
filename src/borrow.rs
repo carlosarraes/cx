@@ -214,6 +214,13 @@ pub fn jump_from_env() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+pub fn pin_from_env() -> Option<String> {
+    std::env::var("CX_PIN")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// Parse a lend response without ever echoing it.
 pub fn parse_grant(stdout: &[u8], host: &str) -> Result<Grant> {
     let mut grant: Grant = serde_json::from_slice(stdout)

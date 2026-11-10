@@ -12,7 +12,9 @@ fn cli(dir: &TempDir, args: &[&str]) -> Command {
         .env("XDG_DATA_HOME", dir.path().join("data"))
         .env("CODEX_HOME", dir.path().join("codex"))
         .env_remove("OPENAI_API_KEY")
-        .env_remove("CODEX_API_KEY");
+        .env_remove("CODEX_API_KEY")
+        .env_remove("CX_PIN")
+        .env_remove("CX_BORROW");
     cmd
 }
 
@@ -739,6 +741,7 @@ mod borrow_flow {
         cmd.env("HOME", dir.path())
             .env("XDG_CONFIG_HOME", dir.path().join("config"))
             .env("CX_BORROW", "owner")
+            .env_remove("CX_PIN")
             .env("CX_CODEX_BIN", codex_stub(dir))
             .env("CX_USAGE_URL", "http://127.0.0.1:9")
             .env("CODEX_REFRESH_TOKEN_URL_OVERRIDE", "http://127.0.0.1:9");
@@ -1019,6 +1022,93 @@ mod borrow_flow {
             "shared login untouched"
         );
         assert!(!dir.path().join("data/cx/t3-overlays").exists());
+    }
+
+    #[test]
+    fn t3_pin_uses_the_named_borrowed_alias_and_does_not_rotate() {
+        let owner = owner_with(&["a", "b"]);
+        let dir = TempDir::new().unwrap();
+        let fake = Fake::new(&dir, &owner);
+        let mut refresh = cli(&dir, &["borrow", "refresh", "--from", "owner"]);
+        fake.apply(&mut refresh);
+        success(refresh.output().unwrap());
+        let calls_after_refresh = fake.calls().len();
+
+        let mut homes = Vec::new();
+        for _ in 0..2 {
+            let out = t3(&dir, &fake).env("CX_PIN", "b").output().unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(stderr.contains("-> b ("), "{stderr}");
+            assert!(!stderr.contains("-> a ("), "{stderr}");
+            assert!(!stderr.contains("using local routing"), "{stderr}");
+            homes.push(home_of(&out));
+        }
+        assert_eq!(
+            fake.calls().len(),
+            calls_after_refresh,
+            "pinned warm cache must not use ssh"
+        );
+        assert!(homes.iter().all(|home| home.ends_with("b")), "{homes:?}");
+        assert!(homes[0].starts_with(dir.path().join("data/cx/borrow-overlays/owner")));
+    }
+
+    #[test]
+    fn t3_unknown_or_expired_pin_fails_without_falling_back() {
+        let owner = owner_with(&["a", "b"]);
+        let dir = TempDir::new().unwrap();
+        auth(&dir, "local");
+        success(command(&dir, &["add", "local", "--current"]));
+        let fake = Fake::new(&dir, &owner);
+        let mut refresh = cli(&dir, &["borrow", "refresh", "--from", "owner"]);
+        fake.apply(&mut refresh);
+        success(refresh.output().unwrap());
+        let calls_after_refresh = fake.calls().len();
+
+        let out = t3(&dir, &fake).env("CX_PIN", "missing").output().unwrap();
+        assert!(!out.status.success());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("unknown pin"), "{stderr}");
+        assert!(stderr.contains("no fallback"), "{stderr}");
+        assert!(!stderr.contains("using local routing"), "{stderr}");
+
+        let cache_path = dir.path().join("data/cx/borrow/owner.json");
+        let mut cache: Value = serde_json::from_slice(&fs::read(&cache_path).unwrap()).unwrap();
+        cache["accounts"]["a"]["expires_at"] = json!(chrono::Utc::now().timestamp());
+        fs::write(&cache_path, cache.to_string()).unwrap();
+        let out = t3(&dir, &fake).env("CX_PIN", "a").output().unwrap();
+        assert!(!out.status.success());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("expired"), "{stderr}");
+        assert!(stderr.contains("no fallback"), "{stderr}");
+        assert!(!stderr.contains("using local routing"), "{stderr}");
+        assert_eq!(
+            fake.calls().len(),
+            calls_after_refresh,
+            "failed pins do not refresh"
+        );
+    }
+
+    #[test]
+    fn t3_empty_pin_is_off() {
+        let owner = owner_with(&["a", "b"]);
+        let dir = TempDir::new().unwrap();
+        let fake = Fake::new(&dir, &owner);
+        let mut refresh = cli(&dir, &["borrow", "refresh", "--from", "owner"]);
+        fake.apply(&mut refresh);
+        success(refresh.output().unwrap());
+        let out = t3(&dir, &fake).env("CX_PIN", "").output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let home = home_of(&out);
+        assert!(home.ends_with("a") || home.ends_with("b"), "{home:?}");
     }
 
     #[test]
