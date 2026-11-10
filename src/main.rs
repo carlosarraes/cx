@@ -1,3 +1,5 @@
+mod t3_guide;
+
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use cx::{
@@ -12,12 +14,15 @@ use std::ffi::OsString;
     name = "cx",
     version,
     about = "Route Codex sessions across accounts and switch selected conversations",
-    after_help = "With no subcommand, launch Codex with live account switching.\nPass Codex arguments after --, e.g. cx -- resume --last."
+    after_help = "With no subcommand, launch Codex with live account switching.\nPass Codex arguments after --, e.g. cx -- resume --last.\nAgent guide: cx --llm\nt3 shim guide: cx --t3"
 )]
 struct Cli {
     /// Print concise agent instructions and supported bot interfaces
     #[arg(long)]
     llm: bool,
+    /// Print a short guide to using cx as a t3 shim
+    #[arg(long)]
+    t3: bool,
     #[command(subcommand)]
     command: Option<Commands>,
     #[arg(last = true)]
@@ -154,7 +159,7 @@ fn main() {
         .any(|arg| arg == "--borrow" || arg.to_str().is_some_and(|s| s.starts_with("--borrow=")));
     let result = cx::borrow::extract(&mut args).and_then(|host| {
         let cli = Cli::parse_from(args);
-        let Some(host) = host.filter(|_| !cli.llm) else {
+        let Some(host) = host.filter(|_| !cli.llm && !cli.t3) else {
             return execute(cli);
         };
         let paths = Paths::discover()?;
@@ -190,6 +195,10 @@ fn main() {
 fn execute(cli: Cli) -> Result<i32> {
     if cli.llm {
         print!("{}", include_str!("llm.txt"));
+        return Ok(0);
+    }
+    if cli.t3 {
+        t3_guide::print();
         return Ok(0);
     }
     let paths = Paths::discover()?;

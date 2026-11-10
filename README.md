@@ -57,6 +57,7 @@ like `cs add`. The browser must sign in to the intended account.
 | `cx switch work --session <UUID> [--interrupt]` | Move one interactive conversation |
 | `cx switch work --from personal [--interrupt]` | Move all sessions on an account |
 | `cx --llm` | Concise agent instructions, supported headless flags and exit codes |
+| `cx --t3` | Live guide to the t3 shim, instance ids, and account aliases |
 | `cx -- resume --last` | Resume the latest conversation with live switching |
 | `cx -- -C /path/to/project` | Start in another project |
 | `cx add <alias> [--current] [--force]` | Save and activate an account |

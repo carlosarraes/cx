@@ -88,3 +88,4 @@ and exec Codex at the same PID. Cold cache => one single-flight refresh (<=15s).
 Limit: the owner's refresh token never leaves the owner. Codex cannot refresh a borrowed token, so an app-server that
 outlives the access token will 401; the next spawn picks a fresh cached token. Keep `cx borrow refresh` running.
 `cx run --borrow` / `cx pick --borrow` lend live and keep a supervised temporary overlay; lend-release runs on exit.
+For a live list of t3 instance ids and aliases on this machine: `cx --t3`.
