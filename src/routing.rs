@@ -31,6 +31,16 @@ pub fn failure(code: i32, message: impl Into<String>) -> anyhow::Error {
     }
     .into()
 }
+/// A pin to a revoked login fails fast instead of falling back.
+pub fn revoked_failure(alias: &str) -> anyhow::Error {
+    failure(
+        21,
+        format!(
+            "{alias}: login revoked; run `{}`; no fallback",
+            auth::reauth_command(alias)
+        ),
+    )
+}
 pub fn resolve(state: &State, name: &str) -> Result<String> {
     if state.accounts.contains_key(name) {
         return Ok(name.into());
@@ -91,6 +101,7 @@ pub fn select(
 ) -> Option<String> {
     s.accounts
         .iter()
+        .filter(|(_, a)| !a.revoked())
         .filter_map(|(alias, a)| {
             let u = a.usage.as_ref()?;
             if !eligible(u, now, cfg) {
@@ -107,7 +118,8 @@ pub fn select(
         })
         .map(|(a, _, _)| a.clone())
 }
-/// Offline pick: eligible cached quota first, else the least-used alias whose quota is unknown or stale.
+/// Offline pick: eligible cached quota first, else the least-used alias whose quota is unknown or
+/// stale. Revoked logins are never picked.
 pub fn select_local(
     s: &State,
     counts: &BTreeMap<String, usize>,
@@ -117,7 +129,7 @@ pub fn select_local(
     select(s, counts, now, cfg).or_else(|| {
         s.accounts
             .iter()
-            .filter(|(_, a)| a.usage.as_ref().is_none_or(|u| !fresh(u, now, cfg)))
+            .filter(|(_, a)| !a.revoked() && a.usage.as_ref().is_none_or(|u| !fresh(u, now, cfg)))
             .min_by_key(|(alias, _)| (counts.get(*alias).copied().unwrap_or(0), *alias))
             .map(|(alias, _)| alias.clone())
     })
@@ -167,10 +179,20 @@ pub fn prepare(paths: &Paths, pin: Option<&str>) -> Result<(State, RoutingConfig
         .cloned()
         .collect();
     for alias in aliases {
+        if s.accounts[&alias].revoked() {
+            if forced.is_some() {
+                return Err(revoked_failure(&alias));
+            }
+            s.accounts.remove(&alias);
+            continue;
+        }
         let account = match auth::credentials(&store, &alias, false) {
             Ok(a) => a,
-            Err(_) => {
+            Err(error) => {
                 if forced.is_some() {
+                    if auth::is_revoked(&error) {
+                        return Err(revoked_failure(&alias));
+                    }
                     return Err(failure(
                         21,
                         format!("{alias}: credentials unavailable; no fallback"),
@@ -183,7 +205,13 @@ pub fn prepare(paths: &Paths, pin: Option<&str>) -> Result<(State, RoutingConfig
         let usage = if account.usage.as_ref().is_some_and(|u| fresh(u, now, &cfg)) {
             account.usage.clone()
         } else {
-            usage::fetch(&store, &alias).ok()
+            match usage::fetch(&store, &alias) {
+                Ok(usage) => Some(usage),
+                Err(error) if forced.is_some() && auth::is_revoked(&error) => {
+                    return Err(revoked_failure(&alias));
+                }
+                Err(_) => None,
+            }
         };
         if usage.is_none() {
             if forced.is_some() {
@@ -246,6 +274,9 @@ pub fn reserve_prepared(
                 .accounts
                 .get(alias)
                 .context("pinned account unavailable")?;
+            if a.revoked() {
+                return Err(revoked_failure(alias));
+            }
             if !a.usage.as_ref().is_some_and(|u| eligible(u, now, cfg)) {
                 return Err(failure(
                     20,

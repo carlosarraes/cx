@@ -47,7 +47,11 @@ struct UsageWindow {
 
 /// Fresh credentials for `alias` plus the bearer token the ChatGPT backend expects.
 pub(crate) fn bearer(store: &Store, alias: &str) -> Result<(Account, String)> {
-    let account = auth::credentials(store, alias, false)?;
+    bearer_within(store, alias, Duration::from_secs(15))
+}
+
+fn bearer_within(store: &Store, alias: &str, timeout: Duration) -> Result<(Account, String)> {
+    let account = auth::credentials_within(store, alias, timeout)?;
     let access_token = account
         .data
         .pointer("/tokens/access_token")
@@ -58,19 +62,35 @@ pub(crate) fn bearer(store: &Store, alias: &str) -> Result<(Account, String)> {
 }
 
 pub fn fetch(store: &Store, alias: &str) -> Result<Observation> {
-    let (account, access_token) = bearer(store, alias)?;
+    fetch_within(store, alias, Duration::from_secs(15))
+}
+
+/// Live usage check; a revoked login is recorded and returned as `auth::LoginRevoked`.
+pub fn fetch_within(store: &Store, alias: &str, timeout: Duration) -> Result<Observation> {
+    let (account, access_token) = bearer_within(store, alias, timeout)?;
     let endpoint = std::env::var("CX_USAGE_URL")
         .unwrap_or_else(|_| "https://chatgpt.com/backend-api/wham/usage".into());
     let response = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(15))
+        .timeout(timeout)
         .build()?
         .get(endpoint)
         .bearer_auth(access_token)
         .header("chatgpt-account-id", &account.account_id)
         .send()
-        .context("usage request failed")?
-        .error_for_status()
-        .context("usage request was rejected")?
+        .context("usage request failed")?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().unwrap_or_default();
+        if auth::revoked_response(status, &body) {
+            auth::mark_revoked(store, alias, &account.email, &account.account_id);
+            return Err(auth::LoginRevoked {
+                alias: alias.to_owned(),
+            }
+            .into());
+        }
+        bail!("usage request was rejected with status {status}");
+    }
+    let response = response
         .json::<UsageResponse>()
         .context("usage response is malformed")?;
     let map = |window: Option<UsageWindow>| {
@@ -95,6 +115,7 @@ pub fn fetch(store: &Store, alias: &str) -> Result<Observation> {
             bail!("account identity changed during usage request");
         }
         stored.usage = Some(observation.clone());
+        stored.login_revoked_at = None;
         Ok(())
     })?;
     Ok(observation)
@@ -106,6 +127,7 @@ pub fn choose_next(state: &State) -> Result<String> {
         .accounts
         .iter()
         .filter(|(alias, _)| state.current.as_ref() != Some(*alias))
+        .filter(|(_, account)| !account.revoked())
         .filter_map(|(alias, account)| {
             let usage = account.usage.as_ref()?;
             if !usage.allowed
@@ -179,7 +201,14 @@ pub fn format_lines_colored(
                 .as_ref()
                 .is_some_and(|u| u.primary.is_some() || u.secondary.is_some());
             let mut parts = Vec::new();
-            if let Some(usage) = &account.usage {
+            if account.revoked() {
+                let text = format!("login revoked, run `{}`", auth::reauth_command(alias));
+                parts.push(if color {
+                    format!("\x1b[1;31m{text}\x1b[0m")
+                } else {
+                    text
+                });
+            } else if let Some(usage) = &account.usage {
                 for (fallback, window) in
                     [("primary", &usage.primary), ("secondary", &usage.secondary)]
                 {
@@ -195,7 +224,7 @@ pub fn format_lines_colored(
                     parts.push("[limited]".into());
                 }
             }
-            if !known {
+            if !known && !account.revoked() {
                 parts.insert(0, "?? usage unknown (run `cx usage --live`)".into());
             }
             let (activity, since) = if current {
@@ -208,7 +237,7 @@ pub fn format_lines_colored(
                 None => activity.into(),
             };
             parts.push(activity);
-            if let Some(usage) = &account.usage {
+            if let Some(usage) = account.usage.as_ref().filter(|_| !account.revoked()) {
                 let age = now.saturating_sub(usage.observed_at);
                 if age > 120 {
                     parts.push(format!("as of {} ago", format_duration(age)));

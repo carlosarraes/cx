@@ -3,7 +3,8 @@ use crate::{
     config::RoutingConfig,
     routing, runtime,
     sessions::{Mode, Reservation},
-    state::{Paths, Store},
+    state::{Paths, State, Store},
+    usage,
 };
 use anyhow::{ensure, Context, Result};
 use std::{
@@ -17,6 +18,7 @@ use std::{
     },
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    time::{Duration, Instant},
 };
 use tokio::signal::unix::{signal, SignalKind};
 
@@ -72,6 +74,76 @@ fn private_overlay_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
+const PROBE_BUDGET: Duration = Duration::from_secs(4);
+
+fn pick_local(
+    state: &State,
+    pin: Option<&str>,
+    counts: &BTreeMap<String, usize>,
+    now: i64,
+    cfg: &RoutingConfig,
+) -> Result<String> {
+    if let Some(pin) = pin {
+        let alias = routing::resolve(state, pin)?;
+        if state.accounts[&alias].revoked() {
+            return Err(routing::revoked_failure(&alias));
+        }
+        return Ok(alias);
+    }
+    if let Some(alias) = routing::select_local(state, counts, now, cfg) {
+        return Ok(alias);
+    }
+    let revoked: Vec<_> = state
+        .accounts
+        .iter()
+        .filter(|(_, a)| a.revoked())
+        .map(|(alias, _)| alias.as_str())
+        .collect();
+    if revoked.is_empty() {
+        anyhow::bail!("no saved account has locally eligible quota");
+    }
+    Err(routing::failure(
+        21,
+        format!(
+            "no usable saved account; login revoked for {}; run `{}`",
+            revoked.join(", "),
+            auth::reauth_command("<alias>")
+        ),
+    ))
+}
+
+/// Check the cache-chosen alias live when its usage is stale, so a revoked login is
+/// found before Codex starts on it. Network failures keep the cached pick.
+fn probe_stale_choice(
+    store: &Store,
+    pin: Option<&str>,
+    counts: &BTreeMap<String, usize>,
+    cfg: &RoutingConfig,
+) {
+    let deadline = Instant::now() + PROBE_BUDGET;
+    let mut probed = std::collections::BTreeSet::new();
+    loop {
+        let Ok(state) = store.read() else { return };
+        let now = chrono::Utc::now().timestamp();
+        let Ok(alias) = pick_local(&state, pin, counts, now, cfg) else {
+            return;
+        };
+        let fresh = state.accounts[&alias]
+            .usage
+            .as_ref()
+            .is_some_and(|u| routing::fresh(u, now, cfg));
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if fresh || remaining.is_zero() || !probed.insert(alias.clone()) {
+            return;
+        }
+        match usage::fetch_within(store, &alias, remaining) {
+            Ok(_) => {}
+            Err(error) if auth::is_revoked(&error) => eprintln!("cx: {alias}: {error}"),
+            Err(_) => return,
+        }
+    }
+}
+
 fn prepare_overlay(paths: &Paths) -> Result<Option<PathBuf>> {
     let store = Store::new(paths.clone());
     let pin = crate::borrow::pin_from_env();
@@ -87,15 +159,12 @@ fn prepare_overlay(paths: &Paths) -> Result<Option<PathBuf>> {
     for session in crate::sessions::Registry::new(paths).list()? {
         *counts.entry(session.account.alias).or_insert(0) += 1;
     }
+    // Probing takes the state lock itself, so it must finish before the transaction below.
+    probe_stale_choice(&store, pin.as_deref(), &counts, &cfg);
     // Serialize reconciliation and overlay writes across simultaneous t3 probes.
     store.transaction(|state| {
         let now = chrono::Utc::now().timestamp();
-        let alias = if let Some(pin) = pin.as_deref() {
-            routing::resolve(state, pin)?
-        } else {
-            routing::select_local(state, &counts, now, &cfg)
-                .context("no saved account has locally eligible quota")?
-        };
+        let alias = pick_local(state, pin.as_deref(), &counts, now, &cfg)?;
         let account = state
             .accounts
             .get_mut(&alias)

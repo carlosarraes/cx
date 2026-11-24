@@ -65,10 +65,12 @@ CX_CODEX_BIN selects the Codex executable. Update Codex if app-server protocol f
 Never compile cs/cx on mac. just sync mac builds on mact and installs on mac.
 
 `cx t3-codex` and the `cx-t3-codex` symlink select locally and exec Codex with the
-original arguments and stdio. The tracked PID becomes Codex. No network, SSH, token
-refresh, or session registration occurs before exec. Fresh cached quota and live
-counts guide selection; missing/stale quota falls back to the least-used saved alias.
-Fresh exhausted accounts are excluded. With no saved accounts, use the current login.
+original arguments and stdio. The tracked PID becomes Codex. No SSH or session
+registration occurs before exec. Fresh cached quota and live counts guide selection.
+If the chosen alias has missing/stale quota, one short live usage check (<=4s total,
+including any token refresh) runs first; a network error keeps the cached pick, else
+it falls back to the least-used saved alias. Fresh exhausted accounts are excluded.
+With no saved accounts, use the current login.
 Stable private overlays live at $XDG_DATA_HOME/cx/t3-overlays/<alias> and are reused.
 Symlinked overlay directories are rejected. Conflicting local overlay entries fail
 without deleting data; reconcile them with the real CODEX_HOME before retrying.
@@ -90,3 +92,15 @@ outlives the access token will 401; the next spawn picks a fresh cached token. K
 `cx run --borrow` / `cx pick --borrow` lend live and keep a supervised temporary overlay; lend-release runs on exit.
 CX_PIN=<alias> pins t3-codex (and local routing without --account) to that alias; empty means off. With CX_BORROW, the pin must be a cached borrowed alias. An unknown or expired pin fails with no fallback.
 For a live list of t3 instance ids, pins, and aliases on this machine: `cx --t3`.
+
+REVOKED LOGINS
+When OpenAI revokes a saved ChatGPT login, usage or token refresh answers 401
+(token_revoked / "invalidated oauth token" / refresh token revoked). cx records
+login_revoked_at for that alias in state.json. `cx usage`, `cx usage --live` and
+`cx list` then show "login revoked, run `cx add <alias> --device-auth --force`".
+Routing (cx run, cx pick, t3-codex, lend) never picks a revoked alias; a pin to one
+(--account, CX_PIN, lend --alias) fails with exit 21 and no fallback. The mark clears
+after `cx add <alias> --force`, `cx refresh`, a successful token refresh, or the next
+successful live usage check (e.g. `cx usage --live`). A t3 app-server keeps the account
+it was spawned with: if its login is revoked, every thread on it fails within ~1s
+until t3 restarts the provider. Re-auth, then restart that t3 instance.

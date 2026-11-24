@@ -355,7 +355,15 @@ fn execute(cli: Cli) -> Result<i32> {
                 } else {
                     ' '
                 };
-                println!("{mark} {alias}  {}", account.email);
+                if account.revoked() {
+                    println!(
+                        "{mark} {alias}  {}  [login revoked, run `{}`]",
+                        account.email,
+                        auth::reauth_command(alias)
+                    );
+                } else {
+                    println!("{mark} {alias}  {}", account.email);
+                }
             }
         }
         Commands::Del { alias } => {
@@ -443,6 +451,7 @@ fn execute(cli: Cli) -> Result<i32> {
                     bail!("live credentials are older than the saved account; run `cx switch {alias}` to restore the latest credentials");
                 }
                 saved.data = live.data;
+                saved.login_revoked_at = None;
                 s.select(&alias)?;
                 Ok(alias)
             })?;
@@ -452,8 +461,11 @@ fn execute(cli: Cli) -> Result<i32> {
         Commands::Usage { live } => {
             if live {
                 for alias in store.read()?.accounts.keys() {
-                    if let Err(error) = usage::fetch(&store, alias) {
-                        eprintln!("{alias}: {error}");
+                    match usage::fetch(&store, alias) {
+                        // The usage line below already names the revoked login and its fix.
+                        Err(error) if auth::is_revoked(&error) => {}
+                        Err(error) => eprintln!("{alias}: {error}"),
+                        Ok(_) => {}
                     }
                 }
             }

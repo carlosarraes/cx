@@ -44,6 +44,15 @@ pub struct Account {
     pub data: serde_json::Value,
     #[serde(default)]
     pub usage: Option<Observation>,
+    /// When the backend last rejected this login as revoked; cleared by a working login.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login_revoked_at: Option<i64>,
+}
+
+impl Account {
+    pub fn revoked(&self) -> bool {
+        self.login_revoked_at.is_some()
+    }
 }
 
 impl std::fmt::Debug for Account {
@@ -53,6 +62,7 @@ impl std::fmt::Debug for Account {
             .field("account_id", &self.account_id)
             .field("data", &"<redacted>")
             .field("usage", &self.usage)
+            .field("login_revoked_at", &self.login_revoked_at)
             .finish()
     }
 }

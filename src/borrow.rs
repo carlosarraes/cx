@@ -291,9 +291,10 @@ fn inventory(paths: &Paths) -> Result<i32> {
         .into_iter()
         // Drop only accounts with fresh evidence they cannot serve requests.
         .filter(|(_, a)| {
-            a.usage
-                .as_ref()
-                .is_none_or(|u| !routing::fresh(u, now, &cfg) || routing::eligible(u, now, &cfg))
+            !a.revoked()
+                && a.usage.as_ref().is_none_or(|u| {
+                    !routing::fresh(u, now, &cfg) || routing::eligible(u, now, &cfg)
+                })
         })
         .map(|(alias, a)| InventoryEntry {
             expires_at: a.data["tokens"]["access_token"]
@@ -318,7 +319,13 @@ pub fn lend(paths: &Paths, options: LendOptions) -> Result<i32> {
         return inventory(paths);
     }
     let alias = match &options.alias {
-        Some(name) => routing::resolve(&state, name)?,
+        Some(name) => {
+            let alias = routing::resolve(&state, name)?;
+            if state.accounts[&alias].revoked() {
+                return Err(routing::revoked_failure(&alias));
+            }
+            alias
+        }
         None => {
             let _ = routing::import_legacy(paths);
             let mut counts = BTreeMap::new();

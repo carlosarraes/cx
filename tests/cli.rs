@@ -1208,3 +1208,118 @@ mod borrow_flow {
         assert!(success(out).contains("\"alias\":\"a\""));
     }
 }
+
+/// Answer `count` usage requests, choosing the reply from the `chatgpt-account-id` header.
+fn usage_server(
+    count: usize,
+    reply: fn(&str) -> (u16, String),
+) -> (String, std::thread::JoinHandle<()>) {
+    use std::io::{BufRead, BufReader, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        for _ in 0..count {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(&mut stream);
+            let mut account = String::new();
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).unwrap() > 0);
+                if let Some(value) = line
+                    .to_ascii_lowercase()
+                    .strip_prefix("chatgpt-account-id:")
+                {
+                    account = value.trim().to_string();
+                }
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            let (status, body) = reply(&account);
+            write!(stream, "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        }
+    });
+    (endpoint, server)
+}
+
+fn usage_ok() -> String {
+    json!({"rate_limit": {"allowed": true,
+        "primary_window": {"used_percent": 10, "limit_window_seconds": 18000, "reset_at": null},
+        "secondary_window": null}})
+    .to_string()
+}
+
+#[test]
+fn revoked_login_is_recorded_shown_skipped_and_cleared_by_a_working_fetch() {
+    let dir = TempDir::new().unwrap();
+    for alias in ["carlos", "carlos2"] {
+        auth(&dir, alias);
+        success(command(&dir, &["add", alias, "--current"]));
+    }
+    let (endpoint, server) = usage_server(2, |account| match account {
+        "carlos" => (
+            401,
+            json!({"error": {"code": "token_revoked",
+            "message": "Encountered invalidated oauth token for user"}})
+            .to_string(),
+        ),
+        _ => (200, usage_ok()),
+    });
+    let output = cli(&dir, &["usage", "--live"])
+        .env("CX_USAGE_URL", &endpoint)
+        .output()
+        .unwrap();
+    server.join().unwrap();
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("rejected"), "{stderr}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.starts_with(
+            "carlos  (0)  login revoked, run `cx add carlos --device-auth --force` · idle"
+        ),
+        "{stdout}"
+    );
+    assert!(stdout.contains("carlos2 (0)  5h 10%"), "{stdout}");
+    let path = dir.path().join("data/cx/state.json");
+    let state: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert!(state["accounts"]["carlos"]["login_revoked_at"].is_i64());
+    assert!(state["accounts"]["carlos2"]
+        .get("login_revoked_at")
+        .is_none());
+    assert!(success(command(&dir, &["list"])).contains(
+        "carlos  carlos@example.test  [login revoked, run `cx add carlos --device-auth --force`]"
+    ));
+
+    let pinned = cli(&dir, &["pick"])
+        .env("CX_PIN", "carlos")
+        .env("CX_USAGE_URL", "http://127.0.0.1:9")
+        .output()
+        .unwrap();
+    assert_eq!(pinned.status.code(), Some(21));
+    assert!(String::from_utf8_lossy(&pinned.stderr)
+        .contains("carlos: login revoked; run `cx add carlos --device-auth --force`; no fallback"));
+    let picked = success(
+        cli(&dir, &["pick"])
+            .env("CX_USAGE_URL", "http://127.0.0.1:9")
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(picked, "carlos2 carlos2@example.test\n");
+
+    let (endpoint, server) = usage_server(2, |_| (200, usage_ok()));
+    success(
+        cli(&dir, &["usage", "--live"])
+            .env("CX_USAGE_URL", &endpoint)
+            .output()
+            .unwrap(),
+    );
+    server.join().unwrap();
+    let state: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert!(state["accounts"]["carlos"]
+        .get("login_revoked_at")
+        .is_none());
+}

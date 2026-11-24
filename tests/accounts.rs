@@ -14,6 +14,7 @@ fn account(email: &str, id: &str) -> Account {
         account_id: id.into(),
         data: json!({"tokens":{"access_token":"secret"}}),
         usage: None,
+        login_revoked_at: None,
     }
 }
 
@@ -380,6 +381,7 @@ fn oauth_account(
             "last_refresh":refreshed_at,
         }),
         usage: None,
+        login_revoked_at: None,
     }
 }
 
@@ -478,5 +480,48 @@ fn refreshed_credentials_are_persisted_before_publishing_to_matching_live_file()
     );
     assert_eq!(durable, refreshed.data);
     assert_eq!(live, durable);
+    Ok(())
+}
+
+#[test]
+fn revoked_refresh_token_marks_the_login_revoked_without_echoing_the_body() -> Result<()> {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    let _environment_guard = REFRESH_ENV_LOCK.lock().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let address = listener.local_addr()?;
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0_u8; 4096];
+        let _ = stream.read(&mut request).unwrap();
+        let body =
+            r#"{"error":{"code":"refresh_token_invalidated","message":"leaked-body-marker"}}"#;
+        write!(stream, "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).unwrap();
+    });
+    let (_temp, store) = store();
+    store.transaction(|state| {
+        state.add(
+            "one",
+            oauth_account("a@b.com", "workspace", "old", "2026-01-01T00:00:00Z"),
+            false,
+        )
+    })?;
+    std::env::set_var(
+        "CODEX_REFRESH_TOKEN_URL_OVERRIDE",
+        format!("http://{address}"),
+    );
+    let result = cx::auth::credentials(&store, "one", true);
+    std::env::remove_var("CODEX_REFRESH_TOKEN_URL_OVERRIDE");
+    server.join().unwrap();
+    let error = result.unwrap_err();
+    assert!(cx::auth::is_revoked(&error));
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("cx add one --device-auth --force"),
+        "{message}"
+    );
+    assert!(!message.contains("leaked-body-marker"));
+    assert!(!message.contains("refresh-old"));
+    assert!(store.read()?.accounts["one"].revoked());
     Ok(())
 }

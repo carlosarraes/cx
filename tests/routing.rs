@@ -25,6 +25,7 @@ fn account(week: f64, reset: i64) -> Account {
             observed_at: 1000,
             allowed: true,
         }),
+        login_revoked_at: None,
     }
 }
 #[test]
@@ -277,4 +278,62 @@ fn reused_process_identity_is_removed() {
     })
     .unwrap();
     assert!(r.list().unwrap().is_empty());
+}
+#[test]
+fn revoked_logins_are_never_selected_while_another_is_usable() {
+    let (_d, r, mut s) = setup();
+    let cfg = RoutingConfig::default();
+    s.accounts.get_mut("a").unwrap().login_revoked_at = Some(900);
+    assert_eq!(
+        routing::select(&s, &BTreeMap::new(), 1000, &cfg),
+        Some("b".into())
+    );
+    // Stale caches: the fallback used to be alphabetical, which picked the revoked "a".
+    assert_eq!(
+        routing::select_local(&s, &BTreeMap::from([("b".into(), 3)]), 5000, &cfg),
+        Some("b".into())
+    );
+    let run = routing::reserve_prepared(
+        r.clone(),
+        &s,
+        &cfg,
+        &routing::RunOptions::default(),
+        None,
+        None,
+        cx::sessions::Mode::Interactive,
+        1000,
+    )
+    .unwrap();
+    assert_eq!(run.get().unwrap().account.alias, "b");
+    drop(run);
+    s.accounts.get_mut("b").unwrap().login_revoked_at = Some(900);
+    assert_eq!(routing::select(&s, &BTreeMap::new(), 1000, &cfg), None);
+    assert_eq!(
+        routing::select_local(&s, &BTreeMap::new(), 5000, &cfg),
+        None
+    );
+}
+#[test]
+fn pin_to_revoked_login_fails_fast_with_the_reauth_command() {
+    let (_d, r, mut s) = setup();
+    s.accounts.get_mut("a").unwrap().login_revoked_at = Some(900);
+    let error = routing::reserve_prepared(
+        r,
+        &s,
+        &RoutingConfig::default(),
+        &routing::RunOptions::default(),
+        Some("a"),
+        None,
+        cx::sessions::Mode::Interactive,
+        1000,
+    )
+    .err()
+    .unwrap();
+    let failure = error.downcast_ref::<routing::Failure>().unwrap();
+    assert_eq!(failure.code, 21);
+    assert!(
+        failure.message.contains("cx add a --device-auth --force"),
+        "{}",
+        failure.message
+    );
 }

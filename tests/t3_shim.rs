@@ -45,14 +45,18 @@ fn paths(dir: &TempDir) -> Paths {
 }
 
 fn save(dir: &TempDir, alias: &str) {
-    let claims = json!({"email":format!("{alias}@example.test"), "exp":1,
+    save_expiring(dir, alias, 1);
+}
+
+fn save_expiring(dir: &TempDir, alias: &str, exp: i64) {
+    let claims = json!({"email":format!("{alias}@example.test"), "exp":exp,
         "https://api.openai.com/auth":{"chatgpt_account_id":alias}});
     let token = format!(
         "e30.{}.sig",
         URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
     );
     Store::new(paths(dir)).transaction(|state| state.add(alias, Account {
-        email:format!("{alias}@example.test"), account_id:alias.into(), usage:None,
+        email:format!("{alias}@example.test"), account_id:alias.into(), usage:None, login_revoked_at:None,
         data:json!({"auth_mode":"chatgpt", "tokens":{"access_token":token,"id_token":token,
             "refresh_token":"synthetic-stored-refresh", "account_id":alias}, "last_refresh":"2026-01-01T00:00:00Z"})
     }, false)).unwrap();
@@ -264,4 +268,99 @@ fn overlay_local_data_conflicts_fail_without_discarding_either_history() {
         fs::read_to_string(paths(&dir).codex_home.join("sessions/shared-history")).unwrap(),
         "shared"
     );
+}
+
+#[test]
+fn pin_to_revoked_login_fails_fast_without_starting_codex() {
+    let dir = TempDir::new().unwrap();
+    save(&dir, "dead");
+    save(&dir, "live");
+    Store::new(paths(&dir))
+        .transaction(|state| {
+            state.accounts.get_mut("dead").unwrap().login_revoked_at = Some(1);
+            Ok(())
+        })
+        .unwrap();
+    let output = command(&dir)
+        .arg("app-server")
+        .env("CX_PIN", "dead")
+        .env("CX_CODEX_BIN", stub(&dir))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(21));
+    assert!(output.stdout.is_empty(), "Codex must not start");
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("dead: login revoked; run `cx add dead --device-auth --force`; no fallback"));
+    let (_, unpinned) = launch(&dir);
+    assert!(unpinned.lines().nth(1).unwrap().ends_with("/live"));
+}
+
+#[test]
+fn stale_cache_choice_is_probed_live_and_a_revoked_login_is_skipped() {
+    use std::io::{BufRead, BufReader, Write};
+    let dir = TempDir::new().unwrap();
+    for alias in ["alpha", "beta"] {
+        save_expiring(&dir, alias, 4_102_444_800);
+    }
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(&mut stream);
+            let mut account = String::new();
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).unwrap() > 0);
+                if let Some(v) = line
+                    .to_ascii_lowercase()
+                    .strip_prefix("chatgpt-account-id:")
+                {
+                    account = v.trim().to_string();
+                }
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            let (status, body) = if account == "alpha" {
+                (
+                    "401 Unauthorized",
+                    json!({"error":{"code":"token_revoked"}}),
+                )
+            } else {
+                (
+                    "200 OK",
+                    json!({"rate_limit":{"allowed":true,
+                    "primary_window":{"used_percent":5,"limit_window_seconds":18000,"reset_at":null},
+                    "secondary_window":null}}),
+                )
+            };
+            let body = body.to_string();
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            seen.push(account);
+        }
+        seen
+    });
+    let output = command(&dir)
+        .arg("app-server")
+        .env("CX_USAGE_URL", endpoint)
+        .env("CX_CODEX_BIN", stub(&dir))
+        .output()
+        .unwrap();
+    assert_eq!(server.join().unwrap(), ["alpha", "beta"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(stderr.contains("alpha: login revoked"), "{stderr}");
+    assert!(stderr.contains("t3-codex -> beta"), "{stderr}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.lines().nth(1).unwrap().ends_with("/beta"));
+    let state = Store::new(paths(&dir)).read().unwrap();
+    assert!(state.accounts["alpha"].revoked());
+    assert!(state.accounts["beta"].usage.is_some());
 }

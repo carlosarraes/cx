@@ -49,6 +49,17 @@ and do not SSH while a token is still valid. Codex cannot refresh a
 borrowed token, so an app-server that outlives the access token will 401
 until the next spawn.
 
+Revoked logins: if OpenAI revokes a saved login (Codex reports 401
+token_revoked or \"refresh token was revoked\"), cx marks the alias and
+`cx usage` / `cx list` show \"login revoked\" with the fix:
+
+  cx add <alias> --device-auth --force
+
+New spawns skip it; when the cached quota is stale, the shim checks
+the chosen alias live first (short timeout). A
+running app-server keeps the account it was spawned with until t3
+restarts it, so re-auth and then restart the t3 provider instance.
+
 Pin an account with CX_PIN=<alias> (empty means off). With CX_BORROW set,
 the pin must name a cached borrowed alias. An unknown or expired pin fails
 without falling back to another account or the local login.
@@ -234,7 +245,19 @@ fn local_aliases() -> Vec<String> {
     Paths::discover()
         .ok()
         .and_then(|paths| Store::new(paths).read().ok())
-        .map(|state| state.accounts.keys().cloned().collect())
+        .map(|state| {
+            state
+                .accounts
+                .iter()
+                .map(|(alias, account)| {
+                    if account.revoked() {
+                        format!("{alias} (login revoked)")
+                    } else {
+                        alias.clone()
+                    }
+                })
+                .collect()
+        })
         .unwrap_or_default()
 }
 

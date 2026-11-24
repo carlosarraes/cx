@@ -13,6 +13,52 @@ use serde_json::{json, Value};
 use crate::state::{Account, Paths, Store};
 
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// The backend refused this login for good; only a new sign-in fixes it.
+#[derive(Debug)]
+pub struct LoginRevoked {
+    pub alias: String,
+}
+
+impl std::fmt::Display for LoginRevoked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "login revoked, run `{}`", reauth_command(&self.alias))
+    }
+}
+
+impl std::error::Error for LoginRevoked {}
+
+pub fn reauth_command(alias: &str) -> String {
+    format!("cx add {alias} --device-auth --force")
+}
+
+pub fn is_revoked(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<LoginRevoked>())
+}
+
+/// 401, or a rejection whose body names a revoked/invalidated token.
+pub(crate) fn revoked_response(status: reqwest::StatusCode, body: &str) -> bool {
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return true;
+    }
+    let body = body.to_ascii_lowercase();
+    !status.is_success() && (body.contains("revoked") || body.contains("invalidated"))
+}
+
+/// Persist the revoked mark, unless the alias now holds a different login.
+pub(crate) fn mark_revoked(store: &Store, alias: &str, email: &str, account_id: &str) {
+    let _ = store.transaction(|state| {
+        if let Some(account) = state
+            .accounts
+            .get_mut(alias)
+            .filter(|a| a.email == email && a.account_id == account_id)
+        {
+            account.login_revoked_at = Some(Utc::now().timestamp());
+        }
+        Ok(())
+    });
+}
 
 pub fn import_current(paths: &Paths) -> Result<Account> {
     ensure_file_store(paths)?;
@@ -59,7 +105,12 @@ pub fn login(_paths: &Paths, codex: &OsStr, device_auth: bool) -> Result<Account
 }
 
 pub fn credentials(store: &Store, alias: &str, force_refresh: bool) -> Result<Account> {
-    credentials_inner(store, alias, None, force_refresh)
+    credentials_inner(store, alias, None, force_refresh, REQUEST_TIMEOUT)
+}
+
+/// Like `credentials`, but a needed refresh gives up after `timeout`.
+pub fn credentials_within(store: &Store, alias: &str, timeout: Duration) -> Result<Account> {
+    credentials_inner(store, alias, None, false, timeout)
 }
 
 pub fn credentials_for(
@@ -74,6 +125,7 @@ pub fn credentials_for(
         alias,
         Some((expected_email, expected_account_id)),
         force_refresh,
+        REQUEST_TIMEOUT,
     )
 }
 
@@ -82,8 +134,10 @@ fn credentials_inner(
     alias: &str,
     expected: Option<(&str, &str)>,
     force_refresh: bool,
+    timeout: Duration,
 ) -> Result<Account> {
-    let (mut account, refreshed) = store.transaction(|state| {
+    let mut identity = None;
+    let result = store.transaction(|state| {
         let account = state
             .accounts
             .get_mut(alias)
@@ -94,12 +148,23 @@ fn credentials_inner(
             bail!("account identity changed while credentials were in use");
         }
         import_newer_live(&store.paths, account)?;
+        identity = Some((account.email.clone(), account.account_id.clone()));
         let refreshed = force_refresh || expires_soon(account)?;
         if refreshed {
-            refresh(account)?;
+            refresh(account, alias, timeout)?;
+            account.login_revoked_at = None;
         }
         Ok((account.clone(), refreshed))
-    })?;
+    });
+    let (mut account, refreshed) = match result {
+        Err(error) if is_revoked(&error) => {
+            if let Some((email, account_id)) = identity {
+                mark_revoked(store, alias, &email, &account_id);
+            }
+            return Err(error);
+        }
+        other => other?,
+    };
     if refreshed {
         account = publish_latest_if_matching(store, alias, &account.email, &account.account_id)?;
     }
@@ -243,6 +308,7 @@ fn read_account(path: &std::path::Path) -> Result<Account> {
         account_id: account_id.to_owned(),
         data,
         usage: None,
+        login_revoked_at: None,
     })
 }
 
@@ -298,19 +364,25 @@ struct RefreshResponse {
     refresh_token: Option<String>,
 }
 
-fn refresh(account: &mut Account) -> Result<()> {
+fn refresh(account: &mut Account, alias: &str, timeout: Duration) -> Result<()> {
     let old_refresh = token(account, "refresh_token")?.to_owned();
     let endpoint = std::env::var("CODEX_REFRESH_TOKEN_URL_OVERRIDE")
         .unwrap_or_else(|_| "https://auth.openai.com/oauth/token".to_owned());
-    let response = reqwest::blocking::Client::builder().timeout(Duration::from_secs(15)).build()?
+    let response = reqwest::blocking::Client::builder().timeout(timeout).build()?
         .post(endpoint)
         .json(&json!({"client_id": CLIENT_ID, "grant_type": "refresh_token", "refresh_token": old_refresh}))
         .send().context("token refresh request failed")?;
-    if !response.status().is_success() {
-        bail!(
-            "token refresh was rejected with status {}",
-            response.status()
-        );
+    let status = response.status();
+    if !status.is_success() {
+        // The body is only classified, never echoed: it may quote credentials.
+        let body = response.text().unwrap_or_default();
+        if revoked_response(status, &body) {
+            return Err(LoginRevoked {
+                alias: alias.to_owned(),
+            }
+            .into());
+        }
+        bail!("token refresh was rejected with status {status}");
     }
     let refreshed: RefreshResponse = response
         .json()
