@@ -13,7 +13,7 @@ use std::{
     fs,
     io::Write,
     os::unix::{
-        fs::{DirBuilderExt, PermissionsExt},
+        fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
         process::{CommandExt, ExitStatusExt},
     },
     path::{Path, PathBuf},
@@ -75,6 +75,7 @@ fn private_overlay_dir(path: &Path) -> Result<()> {
 }
 
 const PROBE_BUDGET: Duration = Duration::from_secs(4);
+const PROBE_BACKOFF_SECONDS: i64 = 60;
 
 fn pick_local(
     state: &State,
@@ -112,36 +113,87 @@ fn pick_local(
     ))
 }
 
-/// Check the cache-chosen alias live when its usage is stale, so a revoked login is
-/// found before Codex starts on it. Network failures keep the cached pick.
+/// Logins a probe found revoked: (alias, email, account_id).
+type Revoked = Vec<(String, String, String)>;
+
+fn apply_revoked(state: &mut State, revoked: &Revoked) {
+    for (alias, email, account_id) in revoked {
+        auth::revoke(state, alias, email, account_id);
+    }
+}
+
+fn recently_unreachable(marker: &Path, now: i64) -> bool {
+    fs::read_to_string(marker)
+        .ok()
+        .and_then(|text| text.trim().parse::<i64>().ok())
+        .is_some_and(|at| at <= now && now - at < PROBE_BACKOFF_SECONDS)
+}
+
+/// Check the cache-chosen alias live when its usage is stale, so a revoked login is found
+/// before Codex starts on it. Bounded by `PROBE_BUDGET` wall clock: only one spawn probes at
+/// a time (others keep the cached pick), and an unreachable backend pauses probing for
+/// `PROBE_BACKOFF_SECONDS`.
 fn probe_stale_choice(
+    paths: &Paths,
     store: &Store,
     pin: Option<&str>,
     counts: &BTreeMap<String, usize>,
     cfg: &RoutingConfig,
-) {
+) -> Revoked {
     let deadline = Instant::now() + PROBE_BUDGET;
+    let mut revoked = Revoked::new();
+    let Ok(flight) = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .open(paths.data.join("t3-probe.lock"))
+    else {
+        return revoked;
+    };
+    if fs2::FileExt::try_lock_exclusive(&flight).is_err() {
+        return revoked;
+    }
+    let marker = paths.data.join("t3-probe-unreachable");
+    if recently_unreachable(&marker, chrono::Utc::now().timestamp()) {
+        return revoked;
+    }
     let mut probed = std::collections::BTreeSet::new();
     loop {
-        let Ok(state) = store.read() else { return };
+        let Ok(mut state) = store.read() else { break };
+        apply_revoked(&mut state, &revoked);
         let now = chrono::Utc::now().timestamp();
         let Ok(alias) = pick_local(&state, pin, counts, now, cfg) else {
-            return;
+            break;
         };
-        let fresh = state.accounts[&alias]
+        let account = &state.accounts[&alias];
+        if account
             .usage
             .as_ref()
-            .is_some_and(|u| routing::fresh(u, now, cfg));
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if fresh || remaining.is_zero() || !probed.insert(alias.clone()) {
-            return;
+            .is_some_and(|u| routing::fresh(u, now, cfg))
+            || !probed.insert(alias.clone())
+        {
+            break;
         }
-        match usage::fetch_within(store, &alias, remaining) {
-            Ok(_) => {}
-            Err(error) if auth::is_revoked(&error) => eprintln!("cx: {alias}: {error}"),
-            Err(_) => return,
+        match usage::probe(store, &alias, deadline) {
+            usage::Probe::Observed => {
+                let _ = fs::remove_file(&marker);
+            }
+            usage::Probe::Revoked => {
+                eprintln!(
+                    "cx: {alias}: login revoked, run `{}`",
+                    auth::reauth_command(&alias)
+                );
+                revoked.push((alias, account.email.clone(), account.account_id.clone()));
+            }
+            usage::Probe::Skipped => break,
+            usage::Probe::Unreachable => {
+                let _ = fs::write(&marker, now.to_string());
+                break;
+            }
         }
     }
+    revoked
 }
 
 fn prepare_overlay(paths: &Paths) -> Result<Option<PathBuf>> {
@@ -160,9 +212,10 @@ fn prepare_overlay(paths: &Paths) -> Result<Option<PathBuf>> {
         *counts.entry(session.account.alias).or_insert(0) += 1;
     }
     // Probing takes the state lock itself, so it must finish before the transaction below.
-    probe_stale_choice(&store, pin.as_deref(), &counts, &cfg);
+    let revoked = probe_stale_choice(paths, &store, pin.as_deref(), &counts, &cfg);
     // Serialize reconciliation and overlay writes across simultaneous t3 probes.
     store.transaction(|state| {
+        apply_revoked(state, &revoked);
         let now = chrono::Utc::now().timestamp();
         let alias = pick_local(state, pin.as_deref(), &counts, now, &cfg)?;
         let account = state

@@ -10,7 +10,7 @@ use chrono::Utc;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::state::{Account, Paths, Store};
+use crate::state::{Account, Paths, State, Store};
 
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
@@ -49,15 +49,19 @@ pub(crate) fn revoked_response(status: reqwest::StatusCode, body: &str) -> bool 
 /// Persist the revoked mark, unless the alias now holds a different login.
 pub(crate) fn mark_revoked(store: &Store, alias: &str, email: &str, account_id: &str) {
     let _ = store.transaction(|state| {
-        if let Some(account) = state
-            .accounts
-            .get_mut(alias)
-            .filter(|a| a.email == email && a.account_id == account_id)
-        {
-            account.login_revoked_at = Some(Utc::now().timestamp());
-        }
+        revoke(state, alias, email, account_id);
         Ok(())
     });
+}
+
+pub(crate) fn revoke(state: &mut State, alias: &str, email: &str, account_id: &str) {
+    if let Some(account) = state
+        .accounts
+        .get_mut(alias)
+        .filter(|a| a.email == email && a.account_id == account_id)
+    {
+        account.login_revoked_at = Some(Utc::now().timestamp());
+    }
 }
 
 pub fn import_current(paths: &Paths) -> Result<Account> {
@@ -106,11 +110,6 @@ pub fn login(_paths: &Paths, codex: &OsStr, device_auth: bool) -> Result<Account
 
 pub fn credentials(store: &Store, alias: &str, force_refresh: bool) -> Result<Account> {
     credentials_inner(store, alias, None, force_refresh, REQUEST_TIMEOUT)
-}
-
-/// Like `credentials`, but a needed refresh gives up after `timeout`.
-pub fn credentials_within(store: &Store, alias: &str, timeout: Duration) -> Result<Account> {
-    credentials_inner(store, alias, None, false, timeout)
 }
 
 pub fn credentials_for(
@@ -348,7 +347,7 @@ fn token_value<'a>(data: &'a Value, name: &str) -> Result<&'a str> {
         .with_context(|| format!("stored credentials lack {name}"))
 }
 
-fn expires_soon(account: &Account) -> Result<bool> {
+pub(crate) fn expires_soon(account: &Account) -> Result<bool> {
     let claims = jwt_claims(token(account, "access_token")?)?;
     let expires_at = claims
         .get("exp")

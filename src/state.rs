@@ -202,17 +202,40 @@ impl Store {
     }
 
     pub fn transaction<T>(&self, f: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
+        let lock = self.open_lock()?;
+        lock.lock_exclusive()?;
+        self.locked(lock, f)
+    }
+
+    /// Like `transaction`, but gives up (`Ok(None)`) if the lock is still busy at `deadline`.
+    pub fn transaction_until<T>(
+        &self,
+        deadline: std::time::Instant,
+        f: impl FnOnce(&mut State) -> Result<T>,
+    ) -> Result<Option<T>> {
+        let lock = self.open_lock()?;
+        while lock.try_lock_exclusive().is_err() {
+            if std::time::Instant::now() >= deadline {
+                return Ok(None);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        self.locked(lock, f).map(Some)
+    }
+
+    fn open_lock(&self) -> Result<File> {
         fs::create_dir_all(&self.paths.data)
             .with_context(|| format!("cannot create {}", self.paths.data.display()))?;
         set_private_dir(&self.paths.data)?;
-        let lock_path = self.paths.data.join("state.lock");
-        let lock = OpenOptions::new()
+        Ok(OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
             .truncate(false)
-            .open(&lock_path)?;
-        lock.lock_exclusive()?;
+            .open(self.paths.data.join("state.lock"))?)
+    }
+
+    fn locked<T>(&self, lock: File, f: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
         let mut state = self.read()?;
         let result = f(&mut state)?;
         validate_state(&state)?;

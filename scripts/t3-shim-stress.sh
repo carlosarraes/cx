@@ -288,6 +288,59 @@ else:
     local_env = dict(base_env, XDG_DATA_HOME=str(root / "data"), STRESS_RECORDS=str(local_records))
     run_phase("local", data, local_env, local_records, False)
 
+    def hang_phase():
+        # Blackholed usage/refresh backend: concurrent spawns must stay within the probe budget.
+        import base64, socket
+        def jwt(alias, exp):
+            claims = {"email": alias + "@example.test", "exp": exp,
+                      "https://api.openai.com/auth": {"chatgpt_account_id": alias}}
+            return "e30." + base64.urlsafe_b64encode(json.dumps(claims).encode()).rstrip(b"=").decode() + ".sig"
+        server = socket.socket()
+        server.bind(("127.0.0.1", 0))
+        server.listen(64)
+        held = []
+        def hold():
+            while True:
+                try:
+                    held.append(server.accept()[0])
+                except OSError:
+                    return
+        threading.Thread(target=hold, daemon=True).start()
+        endpoint = "http://127.0.0.1:%d/x" % server.getsockname()[1]
+        results = {}
+        for label, exp in [("valid-token", 4102444800), ("expiring-token", int(time.time()) + 30)]:
+            hang_root = root / ("data-hang-" + label)
+            hang_data = hang_root / "cx"
+            hang_data.mkdir(parents=True, mode=0o700)
+            (hang_data / "state.json").write_text(json.dumps({"accounts": {a: {
+                "email": a + "@example.test", "account_id": a, "usage": None,
+                "data": {"auth_mode": "chatgpt", "tokens": {"access_token": jwt(a, exp), "id_token": jwt(a, exp),
+                         "refresh_token": "synthetic-refresh", "account_id": a}}}
+                for a in ["hang-a", "hang-b", "hang-c"]}}))
+            env = dict(base_env, XDG_DATA_HOME=str(hang_root), STRESS_RECORDS=str(records),
+                       CX_USAGE_URL=endpoint, CODEX_REFRESH_TOKEN_URL_OVERRIDE=endpoint)
+            before = len(held)
+            started = time.monotonic()
+            children = [subprocess.Popen([str(alias), "--version"], env=env, stdout=subprocess.PIPE,
+                                         stderr=subprocess.PIPE) for _ in range(args.concurrency)]
+            elapsed = []
+            for child in children:
+                output, _ = child.communicate(timeout=60)
+                elapsed.append(time.monotonic() - started)
+                if child.returncode != 0 or output != b"codex-cli stress-fake\n":
+                    raise AssertionError("--version failed against a hanging backend")
+            slowest = max(elapsed) * 1000
+            results[label] = "%d concurrent max %.0fms, %d backend connections" % (
+                args.concurrency, slowest, len(held) - before)
+            if slowest > 5500:
+                raise AssertionError(f"[hang/{label}] slowest spawn took {slowest:.0f}ms (budget 4000ms)")
+        server.close()
+        for connection in held:
+            connection.close()
+        print("PASS [hang]: " + "; ".join(f"{k}: {v}" for k, v in results.items()), flush=True)
+
+    hang_phase()
+
     borrow_records = root / "records-borrow"
     borrow_records.mkdir()
     borrow_data = root / "data-borrow/cx"

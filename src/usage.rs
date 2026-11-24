@@ -47,27 +47,27 @@ struct UsageWindow {
 
 /// Fresh credentials for `alias` plus the bearer token the ChatGPT backend expects.
 pub(crate) fn bearer(store: &Store, alias: &str) -> Result<(Account, String)> {
-    bearer_within(store, alias, Duration::from_secs(15))
-}
-
-fn bearer_within(store: &Store, alias: &str, timeout: Duration) -> Result<(Account, String)> {
-    let account = auth::credentials_within(store, alias, timeout)?;
-    let access_token = account
-        .data
-        .pointer("/tokens/access_token")
-        .and_then(serde_json::Value::as_str)
-        .context("stored credentials lack an access token")?
-        .to_string();
+    let account = auth::credentials(store, alias, false)?;
+    let access_token = access_token(&account)?;
     Ok((account, access_token))
 }
 
-pub fn fetch(store: &Store, alias: &str) -> Result<Observation> {
-    fetch_within(store, alias, Duration::from_secs(15))
+fn access_token(account: &Account) -> Result<String> {
+    account
+        .data
+        .pointer("/tokens/access_token")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .context("stored credentials lack an access token")
 }
 
-/// Live usage check; a revoked login is recorded and returned as `auth::LoginRevoked`.
-pub fn fetch_within(store: &Store, alias: &str, timeout: Duration) -> Result<Observation> {
-    let (account, access_token) = bearer_within(store, alias, timeout)?;
+enum Answer {
+    Usage(Observation),
+    Revoked,
+    Rejected(reqwest::StatusCode),
+}
+
+fn request(account: &Account, access_token: &str, timeout: Duration) -> Result<Answer> {
     let endpoint = std::env::var("CX_USAGE_URL")
         .unwrap_or_else(|_| "https://chatgpt.com/backend-api/wham/usage".into());
     let response = reqwest::blocking::Client::builder()
@@ -80,15 +80,13 @@ pub fn fetch_within(store: &Store, alias: &str, timeout: Duration) -> Result<Obs
         .context("usage request failed")?;
     let status = response.status();
     if !status.is_success() {
+        // The body is only classified, never echoed.
         let body = response.text().unwrap_or_default();
-        if auth::revoked_response(status, &body) {
-            auth::mark_revoked(store, alias, &account.email, &account.account_id);
-            return Err(auth::LoginRevoked {
-                alias: alias.to_owned(),
-            }
-            .into());
-        }
-        bail!("usage request was rejected with status {status}");
+        return Ok(if auth::revoked_response(status, &body) {
+            Answer::Revoked
+        } else {
+            Answer::Rejected(status)
+        });
     }
     let response = response
         .json::<UsageResponse>()
@@ -100,25 +98,97 @@ pub fn fetch_within(store: &Store, alias: &str, timeout: Duration) -> Result<Obs
             limit_window_seconds: value.limit_window_seconds,
         })
     };
-    let observation = Observation {
+    Ok(Answer::Usage(Observation {
         primary: map(response.rate_limit.primary_window),
         secondary: map(response.rate_limit.secondary_window),
         observed_at: Utc::now().timestamp(),
         allowed: response.rate_limit.allowed,
-    };
-    store.transaction(|state| {
-        let stored = state
-            .accounts
-            .get_mut(alias)
-            .context("account was deleted during usage request")?;
-        if stored.account_id != account.account_id || stored.email != account.email {
-            bail!("account identity changed during usage request");
+    }))
+}
+
+fn record(
+    state: &mut State,
+    alias: &str,
+    account: &Account,
+    observation: &Observation,
+) -> Result<()> {
+    let stored = state
+        .accounts
+        .get_mut(alias)
+        .context("account was deleted during usage request")?;
+    if stored.account_id != account.account_id || stored.email != account.email {
+        bail!("account identity changed during usage request");
+    }
+    stored.usage = Some(observation.clone());
+    stored.login_revoked_at = None;
+    Ok(())
+}
+
+/// Live usage check; a revoked login is recorded and returned as `auth::LoginRevoked`.
+pub fn fetch(store: &Store, alias: &str) -> Result<Observation> {
+    let (account, token) = bearer(store, alias)?;
+    match request(&account, &token, Duration::from_secs(15))? {
+        Answer::Usage(observation) => {
+            store.transaction(|state| record(state, alias, &account, &observation))?;
+            Ok(observation)
         }
-        stored.usage = Some(observation.clone());
-        stored.login_revoked_at = None;
-        Ok(())
-    })?;
-    Ok(observation)
+        Answer::Revoked => {
+            auth::mark_revoked(store, alias, &account.email, &account.account_id);
+            Err(auth::LoginRevoked {
+                alias: alias.to_owned(),
+            }
+            .into())
+        }
+        Answer::Rejected(status) => bail!("usage request was rejected with status {status}"),
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub enum Probe {
+    Observed,
+    Revoked,
+    /// Nothing was learned and nothing hit the network (e.g. the token needs a refresh).
+    Skipped,
+    /// The backend was unreachable, slow, or answered unexpectedly.
+    Unreachable,
+}
+
+/// Spawn-path usage check bounded by `deadline` in wall-clock time, lock waits included.
+/// It never refreshes tokens: refresh tokens rotate, so refreshing outside `state.lock`
+/// could race another cx refresh, and refreshing inside it would hold the lock on I/O.
+pub fn probe(store: &Store, alias: &str, deadline: std::time::Instant) -> Probe {
+    let Ok(state) = store.read() else {
+        return Probe::Skipped;
+    };
+    let Some(account) = state.accounts.get(alias) else {
+        return Probe::Skipped;
+    };
+    let Ok(token) = access_token(account) else {
+        return Probe::Skipped;
+    };
+    if auth::expires_soon(account).unwrap_or(true) {
+        return Probe::Skipped;
+    }
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        return Probe::Skipped;
+    }
+    match request(account, &token, remaining) {
+        Ok(Answer::Usage(observation)) => {
+            let _ = store.transaction_until(deadline, |state| {
+                record(state, alias, account, &observation)
+            });
+            Probe::Observed
+        }
+        Ok(Answer::Revoked) => {
+            let _ = store.transaction_until(deadline, |state| {
+                auth::revoke(state, alias, &account.email, &account.account_id);
+                Ok(())
+            });
+            Probe::Revoked
+        }
+        Ok(Answer::Rejected(_)) | Err(_) => Probe::Unreachable,
+    }
 }
 
 pub fn choose_next(state: &State) -> Result<String> {

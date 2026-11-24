@@ -364,3 +364,85 @@ fn stale_cache_choice_is_probed_live_and_a_revoked_login_is_skipped() {
     assert!(state.accounts["alpha"].revoked());
     assert!(state.accounts["beta"].usage.is_some());
 }
+
+/// Accepts connections and never answers, like a blackholed backend.
+fn hanging_listener() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}/x", listener.local_addr().unwrap());
+    let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = accepted.clone();
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for stream in listener.incoming().flatten() {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            held.push(stream);
+        }
+    });
+    (endpoint, accepted)
+}
+
+fn concurrent_versions(dir: &TempDir, endpoint: &str, spawns: usize) -> Vec<std::time::Duration> {
+    let start = std::time::Instant::now();
+    let children: Vec<_> = (0..spawns)
+        .map(|_| {
+            command(dir)
+                .arg("--version")
+                .env("CX_USAGE_URL", endpoint)
+                .env("CODEX_REFRESH_TOKEN_URL_OVERRIDE", endpoint)
+                .env("CX_CODEX_BIN", stub(dir))
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    children
+        .into_iter()
+        .map(|child| {
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            start.elapsed()
+        })
+        .collect()
+}
+
+#[test]
+fn concurrent_spawns_against_a_hanging_backend_stay_within_the_probe_budget() {
+    let budget = std::time::Duration::from_millis(4000 + 1500);
+    for (exp, max_connections) in [
+        (4_102_444_800_i64, 1),
+        (chrono::Utc::now().timestamp() + 30, 0),
+    ] {
+        let dir = TempDir::new().unwrap();
+        for alias in ["a", "b", "c"] {
+            save_expiring(&dir, alias, exp);
+        }
+        let (endpoint, accepted) = hanging_listener();
+        let times = concurrent_versions(&dir, &endpoint, 8);
+        let slowest = times.iter().max().unwrap();
+        assert!(
+            slowest < &budget,
+            "exp={exp}: slowest spawn took {slowest:?}"
+        );
+        let connections = accepted.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            connections <= max_connections,
+            "exp={exp}: {connections} spawns hit the backend; probing must be single-flight"
+        );
+        // A recent unreachable probe makes the next spawn skip the network entirely.
+        let again = concurrent_versions(&dir, &endpoint, 1);
+        assert!(
+            again[0] < std::time::Duration::from_secs(1),
+            "{:?}",
+            again[0]
+        );
+        assert_eq!(
+            accepted.load(std::sync::atomic::Ordering::SeqCst),
+            connections
+        );
+    }
+}
