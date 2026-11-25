@@ -446,3 +446,93 @@ fn concurrent_spawns_against_a_hanging_backend_stay_within_the_probe_budget() {
         );
     }
 }
+
+fn set_usage(dir: &TempDir, alias: &str, usage: serde_json::Value) {
+    Store::new(paths(dir))
+        .transaction(|state| {
+            state.accounts.get_mut(alias).unwrap().usage =
+                Some(serde_json::from_value(usage).unwrap());
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn stale_limited_account_is_skipped_and_all_unusable_fails_with_one_line() {
+    let dir = TempDir::new().unwrap();
+    save(&dir, "alpha");
+    save(&dir, "beta");
+    // 2030-01-01T00:00:00Z: alpha reported 7d 100% hours ago, reset still ahead.
+    let reset = 1_893_456_000_i64;
+    set_usage(
+        &dir,
+        "alpha",
+        json!({"primary": null, "observed_at": 1_000,
+        "secondary": {"used_percent": 100, "resets_at": reset, "limit_window_seconds": 604800},
+        "allowed": false}),
+    );
+    let (_, output) = launch(&dir);
+    assert!(
+        output.lines().nth(1).unwrap().ends_with("/beta"),
+        "{output}"
+    );
+
+    Store::new(paths(&dir))
+        .transaction(|state| {
+            state.accounts.get_mut("beta").unwrap().login_revoked_at = Some(1);
+            Ok(())
+        })
+        .unwrap();
+    let expected = "error: no usable account: alpha limited until 2030-01-01 00:00 +00, \
+beta revoked (run `cx add beta --device-auth --force`)\n";
+    let shim = command(&dir)
+        .arg("app-server")
+        .env("TZ", "UTC")
+        .env("CX_CODEX_BIN", stub(&dir))
+        .output()
+        .unwrap();
+    assert_eq!(shim.status.code(), Some(20));
+    assert!(shim.stdout.is_empty(), "Codex must not start");
+    assert_eq!(String::from_utf8_lossy(&shim.stderr), expected);
+    let pick = isolated_command(&dir, std::path::Path::new(env!("CARGO_BIN_EXE_cx")))
+        .arg("pick")
+        .env_remove("CX_PIN")
+        .env("TZ", "UTC")
+        .output()
+        .unwrap();
+    assert_eq!(pick.status.code(), Some(20));
+    assert_eq!(String::from_utf8_lossy(&pick.stderr), expected);
+
+    // A pin keeps exec-ing on the limited account, with a warning.
+    let pinned = command(&dir)
+        .arg("app-server")
+        .env("TZ", "UTC")
+        .env("CX_PIN", "alpha")
+        .env("CX_CODEX_BIN", stub(&dir))
+        .output()
+        .unwrap();
+    assert!(pinned.status.success());
+    assert!(String::from_utf8_lossy(&pinned.stderr)
+        .contains("cx: pinned alpha is limited until 2030-01-01 00:00 +00"));
+}
+
+#[test]
+fn limited_account_becomes_pickable_once_its_reset_has_passed() {
+    let dir = TempDir::new().unwrap();
+    save(&dir, "alpha");
+    save(&dir, "beta");
+    for alias in ["alpha", "beta"] {
+        set_usage(
+            &dir,
+            alias,
+            json!({"primary": null, "observed_at": 1_000,
+            "secondary": {"used_percent": 100, "resets_at": 2_000, "limit_window_seconds": 604800},
+            "allowed": false}),
+        );
+    }
+    let (_, output) = launch(&dir);
+    assert!(
+        output.lines().nth(1).unwrap().ends_with("/alpha"),
+        "{output}"
+    );
+}

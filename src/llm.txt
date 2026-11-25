@@ -69,7 +69,12 @@ original arguments and stdio. The tracked PID becomes Codex. No SSH or session
 registration occurs before exec. Fresh cached quota and live counts guide selection.
 If the chosen alias has missing/stale quota, one short live usage check (<=4s total,
 including any token refresh) runs first; a network error keeps the cached pick, else
-it falls back to the least-used saved alias. Fresh exhausted accounts are excluded.
+it falls back to the least-used saved alias. Unpinned routing (t3-codex, pick, run)
+never picks an account inside a reported limit: allowed=false or a window >=100% whose
+reset is still ahead, however old that observation. After the reset it is unknown again.
+If every account is limited or revoked, cx exits 20 (21 if all revoked) with one line
+naming each account and its local reset time. A pin to a limited account: t3-codex warns
+and still execs it; cx run/pick --account fail with exit 20, no fallback.
 With no saved accounts, use the current login.
 Stable private overlays live at $XDG_DATA_HOME/cx/t3-overlays/<alias> and are reused.
 Symlinked overlay directories are rejected. Conflicting local overlay entries fail

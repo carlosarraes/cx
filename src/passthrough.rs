@@ -94,23 +94,8 @@ fn pick_local(
     if let Some(alias) = routing::select_local(state, counts, now, cfg) {
         return Ok(alias);
     }
-    let revoked: Vec<_> = state
-        .accounts
-        .iter()
-        .filter(|(_, a)| a.revoked())
-        .map(|(alias, _)| alias.as_str())
-        .collect();
-    if revoked.is_empty() {
-        anyhow::bail!("no saved account has locally eligible quota");
-    }
-    Err(routing::failure(
-        21,
-        format!(
-            "no usable saved account; login revoked for {}; run `{}`",
-            revoked.join(", "),
-            auth::reauth_command("<alias>")
-        ),
-    ))
+    Err(routing::unusable_failure(state, now)
+        .unwrap_or_else(|| anyhow::anyhow!("no saved account has locally eligible quota")))
 }
 
 /// Logins a probe found revoked: (alias, email, account_id).
@@ -218,6 +203,13 @@ fn prepare_overlay(paths: &Paths) -> Result<Option<PathBuf>> {
         apply_revoked(state, &revoked);
         let now = chrono::Utc::now().timestamp();
         let alias = pick_local(state, pin.as_deref(), &counts, now, &cfg)?;
+        if let Some(until) = routing::limited(&state.accounts[&alias], now) {
+            // Pins never fall back; say why Codex is about to report a usage limit.
+            eprintln!(
+                "cx: pinned {alias} is limited until {}",
+                routing::local_time(until)
+            );
+        }
         let account = state
             .accounts
             .get_mut(&alias)

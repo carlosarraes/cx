@@ -337,3 +337,77 @@ fn pin_to_revoked_login_fails_fast_with_the_reauth_command() {
         failure.message
     );
 }
+#[test]
+fn stale_limited_account_is_skipped_until_its_reset_passes() {
+    let (_d, _r, mut s) = setup();
+    let cfg = RoutingConfig::default();
+    // "a" reported 7d 100% long ago (observed_at 1000); its reset is still ahead at 10000.
+    let a = s.accounts.get_mut("a").unwrap().usage.as_mut().unwrap();
+    a.secondary.as_mut().unwrap().used_percent = 100.;
+    let stale = 5000;
+    assert_eq!(
+        routing::select_local(&s, &BTreeMap::from([("b".into(), 9)]), stale, &cfg),
+        Some("b".into())
+    );
+    // allowed=false alone also counts as limited until a reported reset.
+    let mut denied = s.clone();
+    let u = denied
+        .accounts
+        .get_mut("a")
+        .unwrap()
+        .usage
+        .as_mut()
+        .unwrap();
+    u.secondary.as_mut().unwrap().used_percent = 50.;
+    u.allowed = false;
+    assert_eq!(
+        routing::select_local(&denied, &BTreeMap::from([("b".into(), 9)]), stale, &cfg),
+        Some("b".into())
+    );
+    // After every reported reset, "a" is just unknown again and pickable.
+    assert_eq!(
+        routing::select_local(&s, &BTreeMap::from([("b".into(), 9)]), 10001, &cfg),
+        Some("a".into())
+    );
+}
+#[test]
+fn all_limited_or_revoked_names_each_account_and_why() {
+    let (_d, _r, mut s) = setup();
+    s.accounts
+        .get_mut("a")
+        .unwrap()
+        .usage
+        .as_mut()
+        .unwrap()
+        .primary
+        .as_mut()
+        .unwrap()
+        .used_percent = 100.;
+    assert!(
+        routing::unusable_failure(&s, 1500).is_none(),
+        "b is still usable"
+    );
+    s.accounts.get_mut("b").unwrap().login_revoked_at = Some(900);
+    assert_eq!(
+        routing::select_local(&s, &BTreeMap::new(), 1500, &cfg()),
+        None
+    );
+    // Past the primary reset (2000), "a" is unknown again rather than limited.
+    assert!(routing::unusable_failure(&s, 2001).is_none());
+    let error = routing::unusable_failure(&s, 1500).unwrap();
+    let failure = error.downcast_ref::<routing::Failure>().unwrap();
+    assert_eq!(failure.code, 20);
+    assert!(
+        failure
+            .message
+            .starts_with("no usable account: a limited until ")
+            && failure
+                .message
+                .ends_with(", b revoked (run `cx add b --device-auth --force`)"),
+        "{}",
+        failure.message
+    );
+}
+fn cfg() -> RoutingConfig {
+    RoutingConfig::default()
+}

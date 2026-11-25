@@ -68,6 +68,67 @@ pub fn fresh(u: &Observation, now: i64, cfg: &RoutingConfig) -> bool {
             .chain(u.secondary.iter())
             .all(|w| w.resets_at.is_none_or(|t| t > now))
 }
+/// When a limit the account last reported will lift. A limit seen in any observation, however
+/// old, still holds until its reset; after that the account is merely unknown again.
+pub fn limited_until(u: &Observation, now: i64) -> Option<i64> {
+    let windows = || u.primary.iter().chain(u.secondary.iter());
+    let full = windows()
+        .filter(|w| !w.used_percent.is_finite() || w.used_percent >= 100.)
+        .filter_map(|w| w.resets_at)
+        .filter(|t| *t > now)
+        .max();
+    if full.is_some() || u.allowed {
+        return full;
+    }
+    windows()
+        .filter_map(|w| w.resets_at)
+        .filter(|t| *t > now)
+        .max()
+}
+pub fn limited(a: &Account, now: i64) -> Option<i64> {
+    a.usage.as_ref().and_then(|u| limited_until(u, now))
+}
+pub fn local_time(timestamp: i64) -> String {
+    use chrono::{Local, Offset, TimeZone};
+    let Some(time) = Local.timestamp_opt(timestamp, 0).single() else {
+        return timestamp.to_string();
+    };
+    let offset = time.offset().fix().local_minus_utc();
+    let sign = if offset < 0 { '-' } else { '+' };
+    let (hours, minutes) = (offset.abs() / 3600, offset.abs() % 3600 / 60);
+    let zone = if minutes == 0 {
+        format!("{sign}{hours:02}")
+    } else {
+        format!("{sign}{hours:02}:{minutes:02}")
+    };
+    format!("{} {zone}", time.format("%Y-%m-%d %H:%M"))
+}
+/// When every saved account is limited or revoked, one failure naming each and why.
+pub fn unusable_failure(s: &State, now: i64) -> Option<anyhow::Error> {
+    if s.accounts.is_empty() {
+        return None;
+    }
+    let mut any_limited = false;
+    let reasons = s
+        .accounts
+        .iter()
+        .map(|(alias, a)| {
+            if a.revoked() {
+                Some(format!(
+                    "{alias} revoked (run `{}`)",
+                    auth::reauth_command(alias)
+                ))
+            } else {
+                any_limited = true;
+                limited(a, now).map(|t| format!("{alias} limited until {}", local_time(t)))
+            }
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(failure(
+        if any_limited { 20 } else { 21 },
+        format!("no usable account: {}", reasons.join(", ")),
+    ))
+}
 pub fn eligible(u: &Observation, now: i64, cfg: &RoutingConfig) -> bool {
     fresh(u, now, cfg)
         && u.allowed
@@ -119,7 +180,7 @@ pub fn select(
         .map(|(a, _, _)| a.clone())
 }
 /// Offline pick: eligible cached quota first, else the least-used alias whose quota is unknown or
-/// stale. Revoked logins are never picked.
+/// stale. Revoked logins and accounts still inside a reported limit are never picked.
 pub fn select_local(
     s: &State,
     counts: &BTreeMap<String, usize>,
@@ -129,7 +190,11 @@ pub fn select_local(
     select(s, counts, now, cfg).or_else(|| {
         s.accounts
             .iter()
-            .filter(|(_, a)| !a.revoked() && a.usage.as_ref().is_none_or(|u| !fresh(u, now, cfg)))
+            .filter(|(_, a)| {
+                !a.revoked()
+                    && limited(a, now).is_none()
+                    && a.usage.as_ref().is_none_or(|u| !fresh(u, now, cfg))
+            })
             .min_by_key(|(alias, _)| (counts.get(*alias).copied().unwrap_or(0), *alias))
             .map(|(alias, _)| alias.clone())
     })
@@ -183,6 +248,10 @@ pub fn prepare(paths: &Paths, pin: Option<&str>) -> Result<(State, RoutingConfig
             if forced.is_some() {
                 return Err(revoked_failure(&alias));
             }
+            s.accounts.remove(&alias);
+            continue;
+        }
+        if forced.is_none() && limited(&s.accounts[&alias], now).is_some() {
             s.accounts.remove(&alias);
             continue;
         }
@@ -360,6 +429,13 @@ pub fn reserve(
 ) -> Result<Reservation> {
     import_legacy(paths)?;
     let (s, cfg, forced) = prepare(paths, options.account.as_deref())?;
+    if forced.is_none() && s.accounts.is_empty() {
+        // Re-read: prepare's live checks may have just recorded the limits that emptied it.
+        let saved = Store::new(paths.clone()).read()?;
+        if let Some(error) = unusable_failure(&saved, chrono::Utc::now().timestamp()) {
+            return Err(error);
+        }
+    }
     reserve_prepared(
         Registry::new(paths),
         &s,
